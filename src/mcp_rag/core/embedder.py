@@ -13,27 +13,41 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-# Default: Qwen/Qwen3-Embedding-0.6B — released June 2025. 0.6B params,
-# 1024-dim (flexible 32–1024 via Matryoshka), 32k context, 100+ languages,
-# Apache 2.0. MTEB Multilingual 64.33 vs bge-m3 59.56 at the same size
-# class. Encoding queries requires the registered "query" prompt; documents
-# encode as-is. Override via MCP_RAG_EMBED_MODEL.
-DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+# Default: BAAI/bge-m3 — multilingual top-tier (100+ languages incl. RU/EN),
+# 568M params (~1.2GB), 8k native context, 1024-dim, encoder-only (BERT-style),
+# no query/passage prefix gymnastics, Apache 2.0. Verified to fit on a 16GB
+# consumer GPU at the capped sequence length below.
+#
+# Heavier alternatives (opt-in via MCP_RAG_EMBED_MODEL env):
+#   - Qwen/Qwen3-Embedding-0.6B — better MTEB Multilingual (64.33 vs 59.56)
+#     and 32k context, but it's a decoder-only LLM with KV cache that
+#     allocates aggressively on long inputs and OOMs on 16GB VRAM if you
+#     don't shrink the batch even further than the defaults below.
+#   - Qwen/Qwen3-Embedding-4B / 8B — more VRAM, more quality.
+DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
 
-# GPUs love bigger batches; bge-m3 is a heavier model than MiniLM though, so
-# we scale a bit more conservatively than for the previous tiny default.
+# Batch sizes tuned so attention activations fit a 16 GB consumer GPU at the
+# capped sequence length (see _MAX_SEQ_LEN). Bigger batches help only as long
+# as `batch × seq_len² × heads × bytes` stays under VRAM. With Qwen3-0.6B
+# (16 heads, 1024 hidden) and seq=2048, batch=32 in bf16 sits around ~2 GB
+# for the attention buffer — comfortable headroom.
 _BATCH_SIZES_BY_PARAM_BUCKET = {
-    # (param-bucket, device) → batch size
     ("small", "cuda"): 256,
     ("small", "mps"): 128,
     ("small", "cpu"): 32,
-    ("base", "cuda"): 128,
-    ("base", "mps"): 64,
-    ("base", "cpu"): 16,
-    ("large", "cuda"): 64,
-    ("large", "mps"): 32,
-    ("large", "cpu"): 8,
+    ("base", "cuda"): 32,
+    ("base", "mps"): 16,
+    ("base", "cpu"): 8,
+    ("large", "cuda"): 8,
+    ("large", "mps"): 4,
+    ("large", "cpu"): 2,
 }
+
+# Hard cap on per-chunk token length. The retriever chunks at 60 lines (~1.5k
+# tokens worst case) and the graph stores entity descriptions much shorter
+# than that, so the model's native 8k–32k context is wasted compute and
+# turns into OOM on consumer GPUs.
+_MAX_SEQ_LEN = 2048
 
 _embedder: Optional[SentenceTransformer] = None
 _models_dir: Optional[Path] = None
@@ -87,13 +101,31 @@ def get_embedder() -> SentenceTransformer:
     local_path = cache_dir / _model_dir_name(model_id)
     device = _detect_device()
 
+    # bf16 on CUDA halves activation memory; quality difference for
+    # similarity scoring is below noise floor.
+    model_kwargs = {}
+    if device == "cuda":
+        try:
+            import torch
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        except Exception:
+            pass
+
     if local_path.exists():
         logger.info("Loading embedder %s from cache: %s (device=%s)", model_id, local_path, device)
-        _embedder = SentenceTransformer(str(local_path), device=device)
+        _embedder = SentenceTransformer(str(local_path), device=device, model_kwargs=model_kwargs)
     else:
         logger.info("Downloading embedder %s → %s (device=%s)", model_id, local_path, device)
-        _embedder = SentenceTransformer(model_id, cache_folder=str(cache_dir), device=device)
+        _embedder = SentenceTransformer(
+            model_id, cache_folder=str(cache_dir), device=device, model_kwargs=model_kwargs,
+        )
         _embedder.save(str(local_path))
+
+    # Cap the sequence length to keep activation memory bounded; our chunks
+    # never exceed this in practice.
+    if hasattr(_embedder, "max_seq_length") and _embedder.max_seq_length > _MAX_SEQ_LEN:
+        logger.info("Capping max_seq_length %d → %d", _embedder.max_seq_length, _MAX_SEQ_LEN)
+        _embedder.max_seq_length = _MAX_SEQ_LEN
     return _embedder
 
 
