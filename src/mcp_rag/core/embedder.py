@@ -63,3 +63,17 @@ def get_embedder() -> SentenceTransformer:
         _embedder = SentenceTransformer(EMBED_MODEL, cache_folder=str(cache_dir), device=device)
         _embedder.save(str(local_path))
     return _embedder
+
+
+def encode_batch_size() -> int:
+    """Per-batch chunk count tuned for the active device.
+
+    GPUs love bigger batches — the CPU-shaped 32/64 default leaves most of
+    the kernel pipeline idle on a 16GB card.
+    """
+    device = _detect_device()
+    if device == "cuda":
+        return 256
+    if device == "mps":
+        return 128
+    return 32

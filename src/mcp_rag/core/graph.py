@@ -23,7 +23,7 @@ from typing import Optional
 import gitignore_parser
 import json5
 
-from .embedder import get_embedder
+from .embedder import encode_batch_size, get_embedder
 from ..llm.extractor import LLMExtractor, NoOpExtractor
 
 logger = logging.getLogger(__name__)
@@ -816,7 +816,7 @@ class CodeGraph:
             self.faiss_names = [r[0] for r in rows]
             embeddings = embedder.encode(
                 texts, normalize_embeddings=True,
-                show_progress_bar=False, batch_size=64,
+                show_progress_bar=False, batch_size=encode_batch_size(),
             ).astype("float32")
             dim = embeddings.shape[1]
             self.faiss_index = faiss.IndexFlatIP(dim)

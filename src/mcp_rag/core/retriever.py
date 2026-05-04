@@ -20,7 +20,7 @@ from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 import gitignore_parser
 
-from .embedder import get_embedder
+from .embedder import encode_batch_size, get_embedder
 from .formatter import format_code_result
 
 logger = logging.getLogger(__name__)
@@ -165,7 +165,7 @@ class MultiLangCodeRetriever:
             documents,
             normalize_embeddings=True,
             show_progress_bar=True,
-            batch_size=32,
+            batch_size=encode_batch_size(),
         )
         dim = embeddings.shape[1]
         self.faiss_index = faiss.IndexFlatIP(dim)
