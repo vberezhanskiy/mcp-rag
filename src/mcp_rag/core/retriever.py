@@ -301,15 +301,31 @@ class MultiLangCodeRetriever:
         # Identifier-shaped substrings (kebab/snake/dot/Camel) are nearly
         # always intentional — pre-collect chunks that contain them so
         # they're guaranteed to enter the rerank pool even if BM25's
-        # tokenizer dismantled the literal.
+        # tokenizer dismantled the literal. Track per-literal document
+        # frequency so we can IDF-weight the bonus later: a rare token
+        # like 'epcp-flex' is a far stronger signal than 'className'.
         literals = self._query_literals(query)
         literal_hits: set[int] = set()
+        literal_idf: Dict[str, float] = {}
+        lits_lower: list[str] = [l.lower() for l in literals]
         if literals:
-            lits_lower = [l.lower() for l in literals]
+            n_chunks = max(len(self.chunks), 1)
+            per_lit_hits: Dict[str, set[int]] = {l: set() for l in lits_lower}
             for idx, chunk in enumerate(self.chunks):
                 cl = chunk.lower()
-                if any(l in cl for l in lits_lower):
-                    literal_hits.add(idx)
+                for l in lits_lower:
+                    if l in cl:
+                        per_lit_hits[l].add(idx)
+                        literal_hits.add(idx)
+            import math
+            for l, hits in per_lit_hits.items():
+                df = max(len(hits), 1)
+                # log scaling — rare literal in 5/2000 chunks gets weight ~6;
+                # common like 'className' in 1000/2000 gets ~0.7. We scale
+                # this with 0.2 inside the blend so a single rare literal
+                # contributes ~1.2 — enough to dominate when nothing else
+                # in the corpus carries it.
+                literal_idf[l] = math.log(n_chunks / df)
 
         candidates: Dict[int, Tuple[str, str, int, float]] = {}
         all_ids = set(int(i) for i in bm25_top) | set(dense_score_map.keys()) | literal_hits
@@ -332,17 +348,18 @@ class MultiLangCodeRetriever:
             ranked = rerank(query, chunks_for_rerank, top_k=None)
             ce_by_pos = {pos: float(score) for pos, score in ranked}
             blended: list = []
-            lits_lower = [l.lower() for l in literals]
             for pos, (chunk_idx, (chunk, path, line, hybrid_score)) in enumerate(sorted_cands):
                 ce = ce_by_pos.get(pos, 0.0)
-                # Blend cross-encoder + bm25/dense hybrid + literal bonus.
-                # CE leads on concept queries; the hybrid term keeps exact-
-                # token matches alive; the literal bonus surfaces chunks
-                # carrying user-typed kebab/snake/dotted/Camel identifiers.
+                # Blend cross-encoder + bm25/dense hybrid + IDF-weighted
+                # literal bonus. CE leads on concept queries; the hybrid
+                # term keeps exact-token matches alive; the literal term
+                # ensures rare user-typed identifiers (epcp-flex,
+                # useUserStore, data.api.url) outrank chunks that just
+                # share a generic word like 'className'.
                 bonus = 0.0
                 if lits_lower:
                     cl = chunk.lower()
-                    bonus = 0.15 * sum(1 for l in lits_lower if l in cl)
+                    bonus = 0.2 * sum(literal_idf.get(l, 0.0) for l in lits_lower if l in cl)
                 final = 0.65 * ce + 0.35 * float(hybrid_score) + bonus
                 blended.append((chunk_idx, (chunk, path, line, final)))
             blended.sort(key=lambda x: x[1][3], reverse=True)
