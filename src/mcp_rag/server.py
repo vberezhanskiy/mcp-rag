@@ -326,7 +326,53 @@ def _norm_path(p: str) -> str:
     return p.replace("\\", "/").lstrip("./")
 
 
+# Tools that read graph data and benefit from an auto-build on the first call
+# of a fresh session. Inspection / lifecycle / non-graph tools are excluded so
+# they don't block on a 100s+ index build the user didn't ask for.
+_GRAPH_TOOLS_NEEDING_DATA = {
+    "graph_search",
+    "graph_find_usages",
+    "graph_get_file_deps",
+    "graph_file_structure",
+    "graph_get_subgraph",
+    "graph_explain",
+    "graph_dead_code",
+    "graph_find_similar",
+}
+
+
+async def _ensure_graph_built(services: Services) -> Optional[str]:
+    """If the graph is empty, build it now and return a status banner.
+
+    Returns None when the graph already has data or the build failed —
+    callers prepend the banner to their response.
+    """
+    g = services.graph
+    if g.get_stats()["entities"] > 0:
+        return None
+    logger.info("Graph empty — auto-build before serving request")
+    try:
+        result = await g.build()
+    except Exception as e:
+        logger.exception("auto-build failed")
+        return f"⚠ auto-build failed: {e}\n"
+    return (
+        f"ℹ Graph was empty — auto-built: "
+        f"{result['indexed']} files, {result['entities']} entities, "
+        f"{result['relations']} relations.\n\n"
+    )
+
+
 async def _dispatch(services: Services, name: str, args: dict) -> str:
+    if name in _GRAPH_TOOLS_NEEDING_DATA:
+        banner = await _ensure_graph_built(services) or ""
+    else:
+        banner = ""
+    result = await _dispatch_inner(services, name, args)
+    return banner + result if banner else result
+
+
+async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
     g = services.graph
     if name == "graph_build":
         cap = args.get("max_files")

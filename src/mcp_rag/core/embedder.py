@@ -6,10 +6,10 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 #     don't shrink the batch even further than the defaults below.
 #   - Qwen/Qwen3-Embedding-4B / 8B — more VRAM, more quality.
 DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+
+# Cross-encoder reranker. Bi-encoder retrieval (bm25 + dense) collects
+# candidates fast, then this model scores each (query, candidate) pair
+# directly — much higher quality on top-K, at ~50–200 ms per call.
+# bge-reranker-base is multilingual, ~278 MB, pairs naturally with bge-m3.
+DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 # Batch sizes tuned so attention activations fit a 16 GB consumer GPU at the
 # capped sequence length (see _MAX_SEQ_LEN). Bigger batches help only as long
@@ -50,11 +56,21 @@ _BATCH_SIZES_BY_PARAM_BUCKET = {
 _MAX_SEQ_LEN = 2048
 
 _embedder: Optional[SentenceTransformer] = None
+_reranker: Optional[CrossEncoder] = None
 _models_dir: Optional[Path] = None
 
 
 def _embed_model_id() -> str:
     return (os.getenv("MCP_RAG_EMBED_MODEL") or DEFAULT_EMBED_MODEL).strip() or DEFAULT_EMBED_MODEL
+
+
+def _reranker_model_id() -> str:
+    return (os.getenv("MCP_RAG_RERANKER_MODEL") or DEFAULT_RERANKER_MODEL).strip() or DEFAULT_RERANKER_MODEL
+
+
+def rerank_enabled() -> bool:
+    """Cross-encoder rerank is on by default; flip MCP_RAG_RERANK=0 to skip."""
+    return (os.getenv("MCP_RAG_RERANK") or "1").strip() not in {"0", "false", "no", "off"}
 
 
 def _model_dir_name(model_id: str) -> str:
@@ -177,3 +193,57 @@ def encode_query(texts, **kwargs) -> np.ndarray:
 def encode_documents(texts: Iterable[str], **kwargs) -> np.ndarray:
     """Encode passages/entities/chunks. Always raw, no prompt."""
     return get_embedder().encode(texts, **kwargs)
+
+
+def get_reranker() -> CrossEncoder:
+    """Lazy-load the cross-encoder reranker."""
+    global _reranker
+    if _reranker is not None:
+        return _reranker
+    cache_dir = _models_dir or (Path.home() / ".mcp-rag" / "models")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    model_id = _reranker_model_id()
+    local_path = cache_dir / _model_dir_name(model_id)
+    device = _detect_device()
+
+    model_kwargs = {}
+    if device == "cuda":
+        try:
+            import torch
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        except Exception:
+            pass
+
+    if local_path.exists():
+        logger.info("Loading reranker %s from cache: %s (device=%s)", model_id, local_path, device)
+        _reranker = CrossEncoder(str(local_path), device=device, model_kwargs=model_kwargs)
+    else:
+        logger.info("Downloading reranker %s → %s (device=%s)", model_id, local_path, device)
+        _reranker = CrossEncoder(model_id, cache_folder=str(cache_dir), device=device, model_kwargs=model_kwargs)
+        _reranker.save_pretrained(str(local_path))
+    if hasattr(_reranker, "max_length") and _reranker.max_length and _reranker.max_length > _MAX_SEQ_LEN:
+        _reranker.max_length = _MAX_SEQ_LEN
+    return _reranker
+
+
+def rerank(query: str, candidates: Sequence[str], top_k: Optional[int] = None) -> list[tuple[int, float]]:
+    """Cross-encode (query, candidate) pairs and return [(orig_index, score)] sorted desc.
+
+    Caller passes the candidate texts in their original order; we return
+    indices into that list so the caller can reorder its own metadata.
+    Falls back gracefully (returns the input order, no scores) if the
+    cross-encoder fails to load — pure quality knob, not a hard dep.
+    """
+    if not candidates:
+        return []
+    try:
+        ce = get_reranker()
+        pairs = [(query, c) for c in candidates]
+        scores = ce.predict(pairs, show_progress_bar=False)
+    except Exception as e:
+        logger.warning("rerank failed (%s); falling back to input order", e)
+        return [(i, 0.0) for i in range(len(candidates))]
+    ranked = sorted(enumerate(scores), key=lambda it: float(it[1]), reverse=True)
+    if top_k is not None:
+        ranked = ranked[:top_k]
+    return [(i, float(s)) for i, s in ranked]

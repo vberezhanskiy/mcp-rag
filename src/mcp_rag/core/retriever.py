@@ -20,7 +20,14 @@ from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 import gitignore_parser
 
-from .embedder import _embed_model_id, encode_batch_size, encode_documents, encode_query
+from .embedder import (
+    _embed_model_id,
+    encode_batch_size,
+    encode_documents,
+    encode_query,
+    rerank,
+    rerank_enabled,
+)
 from .formatter import format_code_result
 
 logger = logging.getLogger(__name__)
@@ -282,9 +289,23 @@ class MultiLangCodeRetriever:
             combined = 0.5 * bm25_norm + 0.5 * dense_norm
             candidates[idx] = (self.chunks[idx], self.file_paths[idx], self.line_numbers[idx], combined)
 
-        sorted_cands = sorted(candidates.items(), key=lambda x: x[1][3], reverse=True)[:top_k_final]
+        # Take a wider candidate pool so the cross-encoder has something to
+        # rerank meaningfully — too narrow and the bi-encoder's ranking
+        # locks in noise.
+        rerank_pool = max(top_k_final * 4, 20)
+        sorted_cands = sorted(candidates.items(), key=lambda x: x[1][3], reverse=True)[:rerank_pool]
         if not sorted_cands:
             return "Nothing relevant found."
+
+        if rerank_enabled() and len(sorted_cands) > 1:
+            chunks_for_rerank = [c[1][0] for c in sorted_cands]
+            ranked = rerank(query, chunks_for_rerank, top_k=top_k_final)
+            sorted_cands = [
+                (sorted_cands[orig_i][0], (*sorted_cands[orig_i][1][:3], ce_score))
+                for orig_i, ce_score in ranked
+            ]
+        else:
+            sorted_cands = sorted_cands[:top_k_final]
 
         output = []
         for _, (chunk, path, line_num, score) in sorted_cands:
