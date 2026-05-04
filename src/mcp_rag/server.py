@@ -202,6 +202,30 @@ def _build_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="graph_find_similar",
+            description=(
+                "Find entities semantically nearest to a given one — "
+                "cross-file dedup detection. Use before writing a new "
+                "helper / component to check whether something close "
+                "already exists. Matches by meaning, not by name, so it "
+                "catches duplicates Grep and graph_search miss."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entity_name": {"type": "string"},
+                    "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+                    "min_score": {"type": "number", "default": 0.4, "minimum": 0.0, "maximum": 1.0},
+                    "entity_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional type filter (e.g. ['function','component']).",
+                    },
+                },
+                "required": ["entity_name"],
+            },
+        ),
+        Tool(
             name="graph_dead_code",
             description=(
                 "List entities (functions, classes, methods, components) that "
@@ -495,6 +519,32 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
                     lines.append(f"      ← {c['file']} :: {c['from']}  [{c['relation']}]")
         else:
             lines.append("\n## Used by\n  (no external callers found — internal-only or potential dead code)")
+        return "\n".join(lines)
+
+    if name == "graph_find_similar":
+        anchor = args["entity_name"]
+        limit = max(1, min(int(args.get("limit", 10)), 50))
+        min_score = max(0.0, min(float(args.get("min_score", 0.4)), 1.0))
+        types = args.get("entity_types") or None
+        out = g.find_similar_entities(
+            entity_name=anchor,
+            limit=limit,
+            min_score=min_score,
+            entity_types=types,
+        )
+        if out.get("warning"):
+            return out["warning"]
+        results = out["results"]
+        if not results:
+            return (
+                f"No similar entities found for {anchor!r} above score {min_score}. "
+                "Try lowering min_score or check the name with graph_search first."
+            )
+        lines = [f"{len(results)} entities semantically near {anchor!r}:"]
+        for r in results:
+            loc = f":{r['line_start']}" if r.get("line_start") else ""
+            desc = f" — {r['description']}" if r.get("description") else ""
+            lines.append(f"  • [{r['type']}] {r['name']}  score={r['score']:.3f}  ({r['file']}{loc}){desc}")
         return "\n".join(lines)
 
     if name == "graph_dead_code":

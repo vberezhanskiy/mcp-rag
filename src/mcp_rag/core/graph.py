@@ -1158,6 +1158,94 @@ class CodeGraph:
             ).fetchall()
         return {"files": f, "entities": e, "relations": r, "by_type": {t: c for t, c in types}}
 
+    def find_similar_entities(
+        self,
+        entity_name: str,
+        limit: int = 10,
+        min_score: float = 0.4,
+        entity_types: Optional[list[str]] = None,
+    ) -> dict:
+        """Semantically nearest entities to ``entity_name`` via FAISS.
+
+        Use case: dedup detection. "Is there already a helper that does
+        this?" Cross-checks neither Grep nor name-substring search can
+        answer because matches are by *meaning*, not lexical overlap.
+
+        The query entity is excluded from results; same-name results in
+        other files are kept (they ARE the dupes we're hunting).
+        """
+        if self.faiss_index is None or not self.faiss_names:
+            return {
+                "anchor": entity_name,
+                "results": [],
+                "warning": "Graph FAISS index is empty — run graph_build first.",
+            }
+
+        # Pull the canonical (name, description) text for the anchor so we
+        # encode the same shape the index was built from.
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute(
+                "SELECT name, description FROM entities WHERE name = ? "
+                "ORDER BY CASE WHEN description = '' THEN 1 ELSE 0 END LIMIT 1",
+                (entity_name,),
+            ).fetchone()
+        if not row:
+            return {"anchor": entity_name, "results": [], "warning": f"Entity {entity_name!r} not in graph."}
+        anchor_text = f"{row[0]} {row[1] or ''}"
+
+        # Encode and probe the index. We pull more candidates than the
+        # caller asked for so we can drop anchor-self and below-threshold
+        # hits and still hand back a full list.
+        try:
+            q_vec = encode_query([anchor_text], normalize_embeddings=True,
+                                 show_progress_bar=False).astype("float32")
+            k = min(self.faiss_index.ntotal, max(limit * 4, 40))
+            scores, indices = self.faiss_index.search(q_vec, k)
+        except Exception as e:
+            logger.warning("find_similar_entities: FAISS query failed: %s", e)
+            return {"anchor": entity_name, "results": [], "warning": str(e)}
+
+        type_filter = set(entity_types) if entity_types else None
+        seen: set[tuple[str, str]] = set()
+        results: list[dict] = []
+        with sqlite3.connect(self.db_path) as con:
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < 0 or score < min_score:
+                    continue
+                if idx >= len(self.faiss_names):
+                    continue
+                cand_name = self.faiss_names[idx]
+                if cand_name == entity_name:
+                    continue
+                row = con.execute(
+                    "SELECT file, name, type, description, line_start, line_end, snippet "
+                    "FROM entities WHERE name = ? "
+                    "ORDER BY CASE WHEN line_start IS NULL THEN 1 ELSE 0 END, file, line_start "
+                    "LIMIT 1",
+                    (cand_name,),
+                ).fetchone()
+                if not row:
+                    continue
+                if type_filter and row[2] not in type_filter:
+                    continue
+                key = (row[0], row[1])
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({
+                    "file": row[0],
+                    "name": row[1],
+                    "type": row[2],
+                    "description": row[3],
+                    "line_start": row[4],
+                    "line_end": row[5],
+                    "snippet": row[6] or "",
+                    "score": float(score),
+                })
+                if len(results) >= limit:
+                    break
+        return {"anchor": entity_name, "results": results, "warning": None}
+
     def find_dead_code(
         self,
         entity_types: Optional[list[str]] = None,
