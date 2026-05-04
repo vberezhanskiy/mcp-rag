@@ -73,12 +73,16 @@ def _build_tools() -> list[Tool]:
             description=(
                 "Build or refresh the project's code knowledge graph. "
                 "Indexes files via tree-sitter / regex (and an optional LLM fallback). "
+                "By default indexes every stale file in one call. "
                 "Run this before the first graph_* search."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "max_files": {"type": "integer", "default": 200, "description": "Max files indexed in this call"},
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Optional cap on how many files to index in this call. Omit to index all stale files.",
+                    },
                 },
             },
         ),
@@ -239,7 +243,8 @@ def _norm_path(p: str) -> str:
 async def _dispatch(services: Services, name: str, args: dict) -> str:
     g = services.graph
     if name == "graph_build":
-        result = await g.build(max_files=int(args.get("max_files", 200)))
+        cap = args.get("max_files")
+        result = await g.build(max_files=int(cap) if cap is not None else None)
         return json.dumps(result, indent=2)
 
     if name == "graph_index_file":

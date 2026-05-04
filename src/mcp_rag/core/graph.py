@@ -685,7 +685,8 @@ class CodeGraph:
             "needs_build": stale_files > 0 or deleted_files > 0,
         }
 
-    async def build(self, max_files: int = 100) -> dict:
+    async def build(self, max_files: Optional[int] = None) -> dict:
+        """Index every stale file by default. Pass ``max_files`` to cap one call."""
         self._is_building = True
         try:
             t0 = time.time()
@@ -697,8 +698,11 @@ class CodeGraph:
             t1 = time.time()
             logger.info("Graph file scan: %d files in %.2fs", len(files), t1 - t0)
             deleted_files = self._cleanup_deleted_files(files)
-            to_update = [f for f in files if self._file_needs_update(f)][:max_files]
-            logger.info("Graph build: %d/%d files need indexing", len(to_update), len(files))
+            stale = [f for f in files if self._file_needs_update(f)]
+            to_update = stale if max_files is None else stale[:max_files]
+            remaining = max(0, len(stale) - len(to_update))
+            logger.info("Graph build: %d/%d files need indexing (%d remaining)",
+                        len(to_update), len(files), remaining)
 
             sem = asyncio.Semaphore(5)
 
@@ -720,6 +724,7 @@ class CodeGraph:
                         time.time() - t0, len(to_update), e_count)
             return {
                 "indexed": len(to_update),
+                "remaining": remaining,
                 "deleted": deleted_files,
                 "total_files": f_count,
                 "entities": e_count,
