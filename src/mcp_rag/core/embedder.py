@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,27 @@ def configure(models_dir: Path) -> None:
     _models_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _detect_device() -> str:
+    """Pick the best available torch device.
+
+    Honors MCP_RAG_DEVICE override (cuda/mps/cpu) for forcing a specific
+    backend (e.g. on a GPU-capable box where the user wants CPU to avoid
+    VRAM pressure during a heavy build elsewhere).
+    """
+    forced = (os.getenv("MCP_RAG_DEVICE") or "").strip().lower()
+    if forced in {"cuda", "mps", "cpu"}:
+        return forced
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+    except Exception as e:
+        logger.debug("device detection fell back to cpu: %s", e)
+    return "cpu"
+
+
 def get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is not None:
@@ -31,12 +53,13 @@ def get_embedder() -> SentenceTransformer:
     cache_dir = _models_dir or (Path.home() / ".mcp-rag" / "models")
     cache_dir.mkdir(parents=True, exist_ok=True)
     local_path = cache_dir / "all-MiniLM-L6-v2"
+    device = _detect_device()
 
     if local_path.exists():
-        logger.info("Loading embedder from local cache: %s", local_path)
-        _embedder = SentenceTransformer(str(local_path))
+        logger.info("Loading embedder from local cache: %s (device=%s)", local_path, device)
+        _embedder = SentenceTransformer(str(local_path), device=device)
     else:
-        logger.info("Downloading embedder %s → %s", EMBED_MODEL, local_path)
-        _embedder = SentenceTransformer(EMBED_MODEL, cache_folder=str(cache_dir))
+        logger.info("Downloading embedder %s → %s (device=%s)", EMBED_MODEL, local_path, device)
+        _embedder = SentenceTransformer(EMBED_MODEL, cache_folder=str(cache_dir), device=device)
         _embedder.save(str(local_path))
     return _embedder
