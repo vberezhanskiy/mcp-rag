@@ -91,13 +91,14 @@ class MultiLangCodeRetriever:
                 pass
         ignore_exts = {".min.js", ".min.css", ".map", ".pyc", ".class", ".jar"}
         path_lower = str(path).lower()
-        for p in self._ignore_dirs():
-            if p in path_lower:
-                return True
         for ext in ignore_exts:
             if path_lower.endswith(ext):
                 return True
-        return False
+        # Exact-match against path components — substring check would filter
+        # files like Layout.tsx/Login.tsx because their parent dir contains
+        # "out"/"log" as substring.
+        parts = {p.lower() for p in path.parts}
+        return bool(parts & self._ignore_dirs())
 
     def _should_ignore_dir(self, name: str) -> bool:
         return name in self._ignore_dirs()

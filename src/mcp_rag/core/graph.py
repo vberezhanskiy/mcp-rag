@@ -196,10 +196,11 @@ class CodeGraph:
                     return True
             except Exception:
                 pass
-        for d in _IGNORE_DIRS:
-            if d in str(path):
-                return True
-        return False
+        # Exact-match against path components — substring check would filter
+        # files like Layout.tsx/Login.tsx because their parent dir lowercase
+        # contains "out"/"log".
+        parts = set(path.parts)
+        return bool(parts & _IGNORE_DIRS)
 
     @staticmethod
     def _should_ignore_dir(name: str) -> bool:
@@ -667,8 +668,15 @@ class CodeGraph:
                 self._store_extracted(rel, mtime, data)
                 logger.info("Indexed %s: %d entities, %d relations [%s]",
                             rel, entities_count, relations_count, strategy)
+            elif strategy == "llm":
+                # LLM may have transiently failed — keep as unindexed so a
+                # later build retries it.
+                logger.warning("Empty LLM extraction for %s — will retry on next build", rel)
             else:
-                logger.warning("Skipped %s: extractor=%s returned empty result (will retry next build)", rel, strategy)
+                # Deterministic parser found nothing (re-export only, empty
+                # stylesheet, etc.). Mark as seen so it doesn't stay stale.
+                self._mark_file_seen(rel, mtime)
+                logger.debug("Empty %s extraction for %s — marked seen", strategy, rel)
         except Exception as e:
             logger.warning("Failed to index %s: %s", filepath, e)
 
