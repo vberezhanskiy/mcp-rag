@@ -176,6 +176,45 @@ def _build_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="graph_explain",
+            description=(
+                "Compact one-shot view of a file: defined entities, "
+                "dependencies (what it imports/uses), and who calls its "
+                "exported functions/classes from elsewhere. Replaces calling "
+                "graph_file_structure + graph_get_file_deps + graph_find_usages "
+                "separately."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string"},
+                    "top_callers": {"type": "integer", "default": 5, "description": "Max external callers to list per defined entity"},
+                },
+                "required": ["filepath"],
+            },
+        ),
+        Tool(
+            name="graph_dead_code",
+            description=(
+                "List entities (functions, classes, methods, components) that "
+                "no relation in the graph points to — i.e. nothing in the indexed "
+                "code calls, uses, instantiates or inherits them. Refactor aid. "
+                "False positives: dynamic dispatch, public API entry points, "
+                "framework callbacks invoked via reflection."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "entity_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter by types (default: function, method, class, component, interface)",
+                    },
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                },
+            },
+        ),
+        Tool(
             name="graph_clear",
             description="Wipe the knowledge graph for the current project.",
             inputSchema={"type": "object", "properties": {}},
@@ -405,6 +444,59 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
                 lines.append(f"  • {p}")
             if len(items) < len(full):
                 lines.append(f"  … {len(full) - len(items)} more — raise limit or use filter")
+        return "\n".join(lines)
+
+    if name == "graph_explain":
+        rel = _norm_path(args["filepath"])
+        top_callers = max(1, min(int(args.get("top_callers", 5)), 50))
+        info = g.explain_file(rel, top_callers=top_callers)
+        if not info["entities"] and not info["deps"]:
+            return f"Nothing in graph for {rel!r}. Did you run graph_build?"
+        lines = [f"# {rel}"]
+        if info["entities"]:
+            lines.append(f"\n## Defined ({len(info['entities'])})")
+            for e in info["entities"]:
+                loc = f":{e['line_start']}" if e.get("line_start") else ""
+                desc = f" — {e['description']}" if e.get("description") else ""
+                lines.append(f"  • [{e['type']}] {e['name']}{loc}{desc}")
+        if info["deps"]:
+            by_rel: dict[str, list[dict]] = {}
+            for d in info["deps"]:
+                by_rel.setdefault(d["relation"], []).append(d)
+            lines.append(f"\n## Depends on ({len(info['deps'])})")
+            for r, items in by_rel.items():
+                targets = sorted({i["to"] for i in items})
+                lines.append(f"  [{r}] {', '.join(targets)}")
+        if info["used_by"]:
+            lines.append(f"\n## Used by ({len(info['used_by'])} entities have external callers)")
+            for ub in info["used_by"]:
+                lines.append(f"  • {ub['type']} {ub['name']} — {ub['total']} caller(s)")
+                for c in ub["callers"]:
+                    lines.append(f"      ← {c['file']} :: {c['from']}  [{c['relation']}]")
+        else:
+            lines.append("\n## Used by\n  (no external callers found — internal-only or potential dead code)")
+        return "\n".join(lines)
+
+    if name == "graph_dead_code":
+        types = args.get("entity_types") or None
+        limit = max(1, min(int(args.get("limit", 50)), 500))
+        results = g.find_dead_code(entity_types=types, limit=limit)
+        if not results:
+            return "No dead code found (every defined entity is referenced somewhere)."
+        lines = [
+            f"{len(results)} possibly-dead entities "
+            f"(no callers/usages/instantiations in the graph):",
+        ]
+        if not types:
+            lines[0] += " — types: function, method, class, component, interface"
+        for r in results:
+            loc = f":{r['line_start']}" if r.get("line_start") else ""
+            lines.append(f"  • [{r['type']}] {r['name']}  ({r['file']}{loc})")
+        lines.append(
+            "\nNote: dynamic dispatch, public API entry points, and framework "
+            "callbacks (e.g. event handlers wired by string name) won't show "
+            "incoming relations and may be false positives."
+        )
         return "\n".join(lines)
 
     if name == "graph_clear":

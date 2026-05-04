@@ -121,6 +121,11 @@ _IGNORE_DIRS = {
     ".godot", ".import", "addons",
 }
 
+# Files larger than this are skipped — typically minified bundles, lockfiles,
+# generated SQL dumps, ML weights. Tree-sitter and regex extractors can hang
+# or balloon memory on multi-MB inputs.
+_MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+
 
 class CodeGraph:
     """Knowledge Graph of a codebase, persisted in SQLite + FAISS."""
@@ -654,8 +659,14 @@ class CodeGraph:
             return
         rel = filepath.relative_to(self.project_root).as_posix()
         try:
+            stat = filepath.stat()
+            mtime = stat.st_mtime
+            if stat.st_size > _MAX_FILE_BYTES:
+                self._mark_file_seen(rel, mtime)
+                logger.info("Skipped %s: %.1f MB exceeds %.1f MB limit",
+                            rel, stat.st_size / 1024 / 1024, _MAX_FILE_BYTES / 1024 / 1024)
+                return
             code = filepath.read_text(encoding="utf-8", errors="ignore")
-            mtime = filepath.stat().st_mtime
             if len(code.strip()) < 50:
                 self._mark_file_seen(rel, mtime)
                 return
@@ -1078,6 +1089,59 @@ class CodeGraph:
                 "SELECT type, COUNT(*) FROM entities GROUP BY type ORDER BY COUNT(*) DESC"
             ).fetchall()
         return {"files": f, "entities": e, "relations": r, "by_type": {t: c for t, c in types}}
+
+    def find_dead_code(
+        self,
+        entity_types: Optional[list[str]] = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Entities that no relation points to — never called, used, or instantiated.
+
+        Defaults to functions/methods/classes/components since "dead" import
+        or property symbols are usually external references, not local defs.
+        """
+        types = entity_types or ["function", "method", "class", "component", "interface"]
+        placeholders = ",".join("?" * len(types))
+        with sqlite3.connect(self.db_path) as con:
+            rows = con.execute(
+                f"""
+                SELECT e.file, e.name, e.type, e.description, e.line_start, e.line_end, e.snippet
+                FROM entities e
+                WHERE e.type IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1 FROM relations r
+                      WHERE r.to_name = e.name
+                        AND r.relation IN ('calls', 'uses', 'instantiates', 'inherits')
+                  )
+                ORDER BY e.file, e.line_start
+                LIMIT ?
+                """,
+                (*types, limit),
+            ).fetchall()
+        return [
+            {"file": r[0], "name": r[1], "type": r[2], "description": r[3],
+             "line_start": r[4], "line_end": r[5], "snippet": r[6] or ""}
+            for r in rows
+        ]
+
+    def explain_file(self, rel_path: str, top_callers: int = 5) -> dict:
+        """One-shot view of a file: defined entities, deps, and who uses them."""
+        defined = self.get_file_entities(rel_path)
+        deps = self.get_file_deps(rel_path)
+        # For each top-level definition, find external callers/usages.
+        used_by: list[dict] = []
+        for ent in defined:
+            if ent["type"] not in {"function", "method", "class", "component", "interface"}:
+                continue
+            usages = [u for u in self.find_usages(ent["name"]) if u["file"] != rel_path]
+            if usages:
+                used_by.append({
+                    "name": ent["name"],
+                    "type": ent["type"],
+                    "callers": usages[:top_callers],
+                    "total": len(usages),
+                })
+        return {"file": rel_path, "entities": defined, "deps": deps, "used_by": used_by}
 
     def clear(self) -> None:
         with sqlite3.connect(self.db_path) as con:
