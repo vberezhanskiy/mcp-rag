@@ -138,19 +138,36 @@ class MultiLangCodeRetriever:
         line_numbers: list[int] = []
         tokenized_corpus: list[list[str]] = []
 
+        # Threshold below which a generic chunk is dropped as boilerplate. Files
+        # whose entire body is shorter than this still get exactly one fallback
+        # chunk so they don't disappear from the index entirely (config files,
+        # short re-export shims, .storybook/withTheme.tsx-style snippets).
+        MIN_CHUNK_CHARS = 60
+        MIN_FALLBACK_CHARS = 10
+
         for path in tqdm(files, desc="Indexing"):
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     lines = f.readlines()
+                rel = path.relative_to(self.root_dir).as_posix()
+                added = 0
                 for i in range(0, len(lines), self.chunk_size - self.overlap):
                     chunk_lines = lines[i:i + self.chunk_size]
                     chunk = "".join(chunk_lines).rstrip()
-                    if len(chunk.strip()) < 60:
+                    if len(chunk.strip()) < MIN_CHUNK_CHARS:
                         continue
                     documents.append(chunk)
-                    file_paths.append(path.relative_to(self.root_dir).as_posix())
+                    file_paths.append(rel)
                     line_numbers.append(i + 1)
                     tokenized_corpus.append(self._tokenize_text(chunk))
+                    added += 1
+                if added == 0:
+                    whole = "".join(lines).rstrip()
+                    if len(whole.strip()) >= MIN_FALLBACK_CHARS:
+                        documents.append(whole)
+                        file_paths.append(rel)
+                        line_numbers.append(1)
+                        tokenized_corpus.append(self._tokenize_text(whole))
             except Exception as e:
                 logger.warning("Skipped %s: %s", path, e)
 
