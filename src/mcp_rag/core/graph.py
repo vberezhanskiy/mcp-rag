@@ -506,6 +506,8 @@ class CodeGraph:
             "if", "for", "while", "switch", "catch", "return", "typeof", "await",
             "new", "super", "function", "def", "class", "elif", "with", "print",
         }
+        suffix = Path(rel_path).suffix.lower()
+        is_jsx = suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"}
 
         def scope_for_line(line_number: int) -> str:
             best_name = rel_path
@@ -541,6 +543,28 @@ class CodeGraph:
                 if rel_key not in seen_relations:
                     seen_relations.add(rel_key)
                     relations.append({"from": owner, "relation": "calls", "to": symbol})
+
+            # JSX component usage: `<Alert />`, `<Layout.Sider>`, `<MyMenu prop=…>`.
+            # Function calls (`Name(`) above already capture HOC/render-fn forms;
+            # this block fills the gap for declarative JSX, which Tree-sitter
+            # node types in our list don't surface.
+            if is_jsx:
+                for match in re.finditer(r"<\s*([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)?)\b", line):
+                    raw = match.group(1).strip()
+                    if not raw:
+                        continue
+                    component = raw.split(".")[0]
+                    if component not in seen_entities:
+                        seen_entities.add(component)
+                        entities.append({
+                            "name": component,
+                            "type": "component",
+                            "description": "JSX component reference",
+                        })
+                    rel_key = (owner, "instantiates", component)
+                    if rel_key not in seen_relations:
+                        seen_relations.add(rel_key)
+                        relations.append({"from": owner, "relation": "instantiates", "to": component})
 
             for match in re.finditer(r"(?:\.|->)([A-Za-z_][A-Za-z0-9_]*)", line):
                 symbol = match.group(1).strip()
@@ -977,29 +1001,50 @@ class CodeGraph:
         return results
 
     def search_entity(self, query: str, entity_type: Optional[str] = None, limit: int = 10) -> list[dict]:
+        # Tokenize so multi-word queries ("Layout Sider Header") don't fall
+        # through as a single LIKE that nothing matches. Each token contributes
+        # an OR-clause; we then favor rows that hit the most tokens.
+        tokens = [t for t in re.findall(r"[A-Za-z0-9_]+", query) if len(t) > 1]
+        if not tokens:
+            tokens = [query.strip()] if query.strip() else []
+
         with sqlite3.connect(self.db_path) as con:
-            if entity_type:
-                rows = con.execute(
-                    "SELECT file, name, type, description, line_start, line_end, snippet FROM entities "
-                    "WHERE name LIKE ? AND type = ? "
-                    "ORDER BY CASE "
-                    "WHEN lower(name) = lower(?) THEN 0 "
-                    "WHEN lower(name) LIKE lower(?) THEN 1 "
-                    "ELSE 2 END, name "
-                    "LIMIT ?",
-                    (f"%{query}%", entity_type, query, f"{query}%", limit * 2),
-                ).fetchall()
+            if not tokens:
+                rows = []
             else:
-                rows = con.execute(
-                    "SELECT file, name, type, description, line_start, line_end, snippet FROM entities "
-                    "WHERE name LIKE ? "
-                    "ORDER BY CASE "
-                    "WHEN lower(name) = lower(?) THEN 0 "
-                    "WHEN lower(name) LIKE lower(?) THEN 1 "
-                    "ELSE 2 END, name "
-                    "LIMIT ?",
-                    (f"%{query}%", query, f"{query}%", limit * 2),
-                ).fetchall()
+                like_clauses = " OR ".join(["lower(name) LIKE lower(?)"] * len(tokens))
+                like_params = [f"%{t}%" for t in tokens]
+                # Score = count of tokens that match (descending), then exact-match bonus.
+                score_terms = " + ".join(
+                    [f"(CASE WHEN lower(name) LIKE lower(?) THEN 1 ELSE 0 END)"] * len(tokens)
+                )
+                score_params = [f"%{t}%" for t in tokens]
+                exact_q = query.lower()
+                params: list = [
+                    *like_params,
+                    *score_params,
+                    exact_q,
+                    f"{exact_q}%",
+                ]
+                where_type = ""
+                if entity_type:
+                    where_type = " AND type = ?"
+                    params.append(entity_type)
+                params.append(limit * 3)
+
+                sql = (
+                    f"SELECT file, name, type, description, line_start, line_end, snippet, "
+                    f"  ({score_terms}) AS hits "
+                    f"FROM entities "
+                    f"WHERE ({like_clauses}){where_type} "
+                    f"ORDER BY hits DESC, "
+                    f"  CASE WHEN lower(name) = ? THEN 0 "
+                    f"       WHEN lower(name) LIKE ? THEN 1 "
+                    f"       ELSE 2 END, "
+                    f"  name "
+                    f"LIMIT ?"
+                )
+                rows = con.execute(sql, params).fetchall()
         results = []
         for r in rows:
             line_start = r[4]
@@ -1036,10 +1081,24 @@ class CodeGraph:
             return results
         return self._search_raw_occurrences(query, limit=limit)
 
-    def get_subgraph(self, entity_name: str, depth: int = 2) -> dict:
+    def get_subgraph(
+        self,
+        entity_name: str,
+        depth: int = 2,
+        per_node_cap: int = 50,
+    ) -> dict:
+        """BFS expansion around an entity.
+
+        Common names like ``Layout``/``Header`` may appear as ``to_name`` in
+        thousands of relations because every file declaring ``const Header = ...``
+        contributes a separate node by lexical name. To keep results usable we
+        cap how many relations we walk through *per BFS node* — the rest are
+        counted as ``truncated_at`` so the caller sees the partial-result flag.
+        """
         visited: set[str] = set()
         seen_rels: set = set()
         all_relations: list = []
+        truncated_nodes: list[str] = []
         queue: list[tuple[str, int]] = [(entity_name, 0)]
         with sqlite3.connect(self.db_path) as con:
             while queue:
@@ -1047,11 +1106,18 @@ class CodeGraph:
                 if current in visited or cur_depth > depth:
                     continue
                 visited.add(current)
+                # Probe count first to surface truncation in the result.
+                total = con.execute(
+                    "SELECT COUNT(*) FROM relations WHERE from_name = ? OR to_name = ?",
+                    (current, current),
+                ).fetchone()[0]
                 rows = con.execute(
                     "SELECT file, from_name, relation, to_name FROM relations "
-                    "WHERE from_name = ? OR to_name = ?",
-                    (current, current),
+                    "WHERE from_name = ? OR to_name = ? LIMIT ?",
+                    (current, current, per_node_cap),
                 ).fetchall()
+                if total > per_node_cap:
+                    truncated_nodes.append(f"{current} ({total} total, kept {per_node_cap})")
                 for r in rows:
                     key = (r[1], r[2], r[3])
                     if key in seen_rels:
@@ -1078,7 +1144,11 @@ class CodeGraph:
                     })
         entities.sort(key=lambda e: (e.get("file", ""), e.get("line_start") or 0, e.get("name", "")))
         all_relations.sort(key=lambda r: (r.get("file", ""), r.get("from", ""), r.get("relation", ""), r.get("to", "")))
-        return {"entities": entities, "relations": all_relations}
+        return {
+            "entities": entities,
+            "relations": all_relations,
+            "truncated_nodes": truncated_nodes,
+        }
 
     def get_stats(self) -> dict:
         with sqlite3.connect(self.db_path) as con:

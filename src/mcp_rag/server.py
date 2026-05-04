@@ -145,12 +145,18 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_get_subgraph",
-            description="BFS the graph around an entity up to the given depth.",
+            description=(
+                "BFS the graph around an entity up to the given depth. "
+                "Each node's relations are capped (per_node_cap) — common "
+                "names like Layout/Header otherwise return tens of thousands "
+                "of edges. Prefer unique entity names for useful results."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "entity_name": {"type": "string"},
                     "depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
+                    "per_node_cap": {"type": "integer", "default": 50, "minimum": 5, "maximum": 500},
                 },
                 "required": ["entity_name"],
             },
@@ -371,14 +377,26 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
 
     if name == "graph_get_subgraph":
         depth = max(1, min(int(args.get("depth", 2)), 4))
-        sub = g.get_subgraph(args["entity_name"], depth=depth)
+        cap = max(5, min(int(args.get("per_node_cap", 50)), 500))
+        sub = g.get_subgraph(args["entity_name"], depth=depth, per_node_cap=cap)
         if not sub["entities"]:
             return f"No subgraph for {args['entity_name']!r}."
         lines = [
-            f"Subgraph around {args['entity_name']!r} (depth {depth}):",
+            f"Subgraph around {args['entity_name']!r} (depth {depth}, per_node_cap {cap}):",
             f"  Entities: {len(sub['entities'])}, relations: {len(sub['relations'])}",
-            "Entities:",
         ]
+        if sub.get("truncated_nodes"):
+            lines.append(
+                f"  ⚠ partial result — {len(sub['truncated_nodes'])} hub-like nodes had "
+                f"more relations than the cap. Common names (e.g. Layout/Header) "
+                f"often share lexical IDs across many files; prefer a more specific "
+                f"entity_name. Truncated:"
+            )
+            for tn in sub["truncated_nodes"][:5]:
+                lines.append(f"    - {tn}")
+            if len(sub["truncated_nodes"]) > 5:
+                lines.append(f"    … and {len(sub['truncated_nodes']) - 5} more")
+        lines.append("Entities:")
         for e in sub["entities"]:
             lines.extend(g.format_entity_result(e))
         lines.append("Relations:")
