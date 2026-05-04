@@ -20,7 +20,7 @@ from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 import gitignore_parser
 
-from .embedder import encode_batch_size, get_embedder
+from .embedder import _embed_model_id, encode_batch_size, get_embedder
 from .formatter import format_code_result
 
 logger = logging.getLogger(__name__)
@@ -240,7 +240,10 @@ class MultiLangCodeRetriever:
                     h.update(f"{rel}:{stat.st_mtime_ns}:{stat.st_size}".encode())
                 except OSError:
                     continue
-        h.update(f"{self.chunk_size}:{self.overlap}".encode())
+        # Include model id and chunking params so changing the embedder
+        # invalidates the cache (FAISS index would otherwise have a stale
+        # dimension and fail the next encode/search).
+        h.update(f"{self.chunk_size}:{self.overlap}:{_embed_model_id()}".encode())
         return h.hexdigest()
 
     def rebuild(self) -> None:
