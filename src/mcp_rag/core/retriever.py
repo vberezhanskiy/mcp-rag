@@ -298,12 +298,21 @@ class MultiLangCodeRetriever:
             return "Nothing relevant found."
 
         if rerank_enabled() and len(sorted_cands) > 1:
+            # Blend the cross-encoder's semantic score with the original
+            # bm25+dense hybrid so exact-token matches (e.g. unique class
+            # names, kebab-case literals) keep some weight. Pure CE
+            # ranking otherwise outranks a literal hit by something that's
+            # only thematically related.
             chunks_for_rerank = [c[1][0] for c in sorted_cands]
-            ranked = rerank(query, chunks_for_rerank, top_k=top_k_final)
-            sorted_cands = [
-                (sorted_cands[orig_i][0], (*sorted_cands[orig_i][1][:3], ce_score))
-                for orig_i, ce_score in ranked
-            ]
+            ranked = rerank(query, chunks_for_rerank, top_k=None)
+            ce_by_pos = {pos: float(score) for pos, score in ranked}
+            blended: list = []
+            for pos, (chunk_idx, (chunk, path, line, hybrid_score)) in enumerate(sorted_cands):
+                ce = ce_by_pos.get(pos, 0.0)
+                final = 0.65 * ce + 0.35 * float(hybrid_score)
+                blended.append((chunk_idx, (chunk, path, line, final)))
+            blended.sort(key=lambda x: x[1][3], reverse=True)
+            sorted_cands = blended[:top_k_final]
         else:
             sorted_cands = sorted_cands[:top_k_final]
 
