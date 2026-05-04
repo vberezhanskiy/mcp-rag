@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import Resource, ResourceTemplate, TextContent, Tool
+from pydantic import AnyUrl
 
 from .config import Config
 from .core import embedder
@@ -574,6 +576,127 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
     return f"Unknown tool: {name}"
 
 
+# ─── Resources ─────────────────────────────────────────────────────────────
+#
+# Same backend as the tool dispatcher, but exposed via the MCP resource
+# protocol so Claude Code (and any other MCP client) can let users attach
+# rich context with one @-pick instead of three tool round-trips.
+
+
+def _render_overview(services: Services) -> str:
+    g = services.graph
+    cfg = services.config
+    stats = g.get_stats()
+    status = g.get_build_status()
+    lines = [
+        f"# Project overview — {cfg.project_root.name}",
+        "",
+        f"Root: `{cfg.project_root}`",
+        f"Indexed files: {status['indexed_project_files']} / {status['total_files']}",
+        f"Entities: {stats['entities']:,} | relations: {stats['relations']:,}",
+    ]
+    if stats["entities"] == 0:
+        lines.append("\n⚠ Graph is empty — run `graph_build` first.")
+        return "\n".join(lines)
+    if stats["by_type"]:
+        lines.append("\n## Entity types")
+        for t, c in stats["by_type"].items():
+            lines.append(f"- {t}: {c:,}")
+    # Most-referenced entities — cheap "important things to know about" digest.
+    import sqlite3
+    with sqlite3.connect(g.db_path) as con:
+        rows = con.execute(
+            "SELECT to_name, COUNT(*) AS c FROM relations "
+            "WHERE relation IN ('calls', 'instantiates', 'uses', 'imports') "
+            "GROUP BY to_name ORDER BY c DESC LIMIT 15"
+        ).fetchall()
+    if rows:
+        lines.append("\n## Most referenced symbols")
+        for name, c in rows:
+            lines.append(f"- {name} — {c} refs")
+    return "\n".join(lines)
+
+
+def _render_file(services: Services, path: str) -> str:
+    rel = _norm_path(path)
+    info = services.graph.explain_file(rel, top_callers=5)
+    if not info["entities"] and not info["deps"]:
+        return f"# {rel}\n\nNot in graph. Did you run `graph_build`?"
+    # Filter to "real" definitions — regex sweep records every `name(` form as
+    # a "function" call target with description "Referenced call target", which
+    # buries actual class/function declarations from tree-sitter (those have
+    # "Extracted from <node>" descriptions or originate from structured parsers).
+    primary_types = {"class", "function", "method", "component", "interface", "enum", "type", "module"}
+    primary = [
+        e for e in info["entities"]
+        if e["type"] in primary_types
+        and len(e.get("name") or "") > 1
+        and "Referenced" not in (e.get("description") or "")
+    ]
+    lines = [f"# {rel}"]
+    if primary:
+        lines.append(f"\n## Defined ({len(primary)})")
+        for e in primary[:80]:
+            loc = f":{e['line_start']}" if e.get("line_start") else ""
+            desc = f" — {e['description']}" if e.get("description") else ""
+            lines.append(f"- [{e['type']}] **{e['name']}**{loc}{desc}")
+        if len(primary) > 80:
+            lines.append(f"- … {len(primary) - 80} more")
+    if info["deps"]:
+        by_rel: dict[str, list[dict]] = {}
+        for d in info["deps"]:
+            by_rel.setdefault(d["relation"], []).append(d)
+        lines.append(f"\n## Dependencies ({len(info['deps'])})")
+        for r, items in by_rel.items():
+            targets = sorted({i["to"] for i in items})
+            lines.append(f"- **{r}** → {', '.join(targets[:30])}"
+                         + (f"  (…{len(targets)-30} more)" if len(targets) > 30 else ""))
+    primary_names = {e["name"] for e in primary}
+    used_by = [ub for ub in info["used_by"] if ub["name"] in primary_names]
+    if used_by:
+        lines.append(f"\n## External callers")
+        for ub in used_by:
+            lines.append(f"- {ub['type']} **{ub['name']}** — {ub['total']} caller(s)")
+            for c in ub["callers"]:
+                lines.append(f"  - `{c['file']}` :: {c['from']}  *[{c['relation']}]*")
+    return "\n".join(lines)
+
+
+def _render_search(services: Services, query: str) -> str:
+    return f"# Semantic search: {query!r}\n\n" + services.retriever.search(
+        query, top_k_initial=40, top_k_final=8, max_chunk_preview=1200
+    )
+
+
+def _render_explain(services: Services, entity: str) -> str:
+    g = services.graph
+    results = g.search_entity(entity, limit=5)
+    if not results:
+        return f"# {entity}\n\nNot found in graph."
+    lines = [f"# {entity}", ""]
+    for r in results:
+        lines.extend(g.format_entity_result(r))
+        callers = g.get_callers(r["name"])
+        if callers:
+            lines.append(f"  callers ({len(callers)}):")
+            for c in callers[:10]:
+                lines.append(f"    ← {c['file']} :: {c['caller']}")
+    return "\n".join(lines)
+
+
+def _resource_kind_and_param(uri: AnyUrl) -> tuple[str, str]:
+    """Parse rag://kind/param → (kind, decoded param)."""
+    from urllib.parse import unquote
+    raw = str(uri)
+    if not raw.startswith("rag://"):
+        return ("", "")
+    rest = raw[len("rag://"):]
+    if "/" in rest:
+        kind, _, param = rest.partition("/")
+        return (kind, unquote(param))
+    return (rest, "")
+
+
 def build_server(services: Services) -> Server:
     server = Server("mcp-rag")
     tools = _build_tools()
@@ -590,6 +713,59 @@ def build_server(services: Services) -> Server:
             logger.exception("Tool %s failed", name)
             text = f"Error in {name}: {e}"
         return [TextContent(type="text", text=text)]
+
+    @server.list_resources()
+    async def list_resources() -> list[Resource]:
+        return [
+            Resource(
+                uri=AnyUrl("rag://overview"),
+                name="Project overview",
+                description="Top-level digest of the project: file count, entity types, most-referenced symbols. Pick this first when entering an unfamiliar codebase.",
+                mimeType="text/markdown",
+            ),
+        ]
+
+    @server.list_resource_templates()
+    async def list_resource_templates() -> list[ResourceTemplate]:
+        return [
+            ResourceTemplate(
+                uriTemplate="rag://file/{path}",
+                name="File context",
+                description="Defined entities + dependencies + external callers for a project-relative path. Bundles graph_file_structure + graph_get_file_deps + graph_find_usages.",
+                mimeType="text/markdown",
+            ),
+            ResourceTemplate(
+                uriTemplate="rag://search/{query}",
+                name="Semantic search",
+                description="Hybrid BM25 + dense-embedding search across project source. Pick when you don't know exact names — ranks by meaning.",
+                mimeType="text/markdown",
+            ),
+            ResourceTemplate(
+                uriTemplate="rag://explain/{entity}",
+                name="Entity card",
+                description="Locations of an entity (class/function/component) plus its callers. Useful for refactor scoping.",
+                mimeType="text/markdown",
+            ),
+        ]
+
+    @server.read_resource()
+    async def read_resource(uri: AnyUrl):
+        kind, param = _resource_kind_and_param(uri)
+        try:
+            if kind == "overview":
+                content = _render_overview(services)
+            elif kind == "file" and param:
+                content = _render_file(services, param)
+            elif kind == "search" and param:
+                content = _render_search(services, param)
+            elif kind == "explain" and param:
+                content = _render_explain(services, param)
+            else:
+                content = f"Unknown resource: {uri}"
+        except Exception as e:
+            logger.exception("read_resource %s failed", uri)
+            content = f"Error rendering {uri}: {e}"
+        return [ReadResourceContents(content=content, mime_type="text/markdown")]
 
     return server
 
