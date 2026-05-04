@@ -231,6 +231,11 @@ def _build_tools() -> list[Tool]:
     ]
 
 
+def _norm_path(p: str) -> str:
+    """Normalize a project-relative path to POSIX-style separators."""
+    return p.replace("\\", "/").lstrip("./")
+
+
 async def _dispatch(services: Services, name: str, args: dict) -> str:
     g = services.graph
     if name == "graph_build":
@@ -244,7 +249,7 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
         if not path.exists():
             return f"File not found: {args['filepath']}"
         await g.reindex_file(path)
-        rel = str(path.relative_to(services.config.project_root))
+        rel = path.relative_to(services.config.project_root).as_posix()
         entities = g.get_file_entities(rel)
         return f"Indexed {rel}: {len(entities)} entities."
 
@@ -281,10 +286,11 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
         return "\n".join(lines)
 
     if name == "graph_get_file_deps":
-        deps = g.get_file_deps(args["filepath"])
+        rel = _norm_path(args["filepath"])
+        deps = g.get_file_deps(rel)
         if not deps:
-            return f"No dependencies for {args['filepath']!r}."
-        lines = [f"Dependencies of {args['filepath']!r} ({len(deps)}):"]
+            return f"No dependencies for {rel!r}."
+        lines = [f"Dependencies of {rel!r} ({len(deps)}):"]
         by_rel: dict[str, list[dict]] = {}
         for d in deps:
             by_rel.setdefault(d["relation"], []).append(d)
@@ -295,12 +301,13 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
         return "\n".join(lines)
 
     if name == "graph_file_structure":
-        entities = g.get_file_entities(args["filepath"])
+        rel = _norm_path(args["filepath"])
+        entities = g.get_file_entities(rel)
         if not entities:
-            return f"No entities in {args['filepath']!r}."
-        lines = [f"Structure of {args['filepath']!r} ({len(entities)} entities):"]
+            return f"No entities in {rel!r}."
+        lines = [f"Structure of {rel!r} ({len(entities)} entities):"]
         for e in entities:
-            lines.extend(g.format_entity_result({"file": args["filepath"], **e}, include_snippet=False))
+            lines.extend(g.format_entity_result({"file": rel, **e}, include_snippet=False))
         return "\n".join(lines)
 
     if name == "graph_get_subgraph":

@@ -237,7 +237,7 @@ class CodeGraph:
         return [r[0] for r in rows]
 
     def _file_needs_update(self, filepath: Path) -> bool:
-        rel = str(filepath.relative_to(self.project_root))
+        rel = filepath.relative_to(self.project_root).as_posix()
         mtime = filepath.stat().st_mtime
         with sqlite3.connect(self.db_path) as con:
             row = con.execute(
@@ -252,7 +252,7 @@ class CodeGraph:
             con.execute("DELETE FROM file_meta WHERE file = ?", (rel_path,))
 
     def _cleanup_deleted_files(self, existing_files: list[Path]) -> int:
-        existing_rel_paths = {str(p.relative_to(self.project_root)) for p in existing_files}
+        existing_rel_paths = {p.relative_to(self.project_root).as_posix() for p in existing_files}
         indexed_rel_paths = self._get_files_indexed()
         deleted_rel_paths = sorted(set(indexed_rel_paths) - existing_rel_paths)
         for rel_path in deleted_rel_paths:
@@ -422,7 +422,7 @@ class CodeGraph:
         return {"entities": entities, "relations": relations}
 
     def _extract_structured(self, filepath: Path, code: str) -> dict:
-        rel_path = str(filepath.relative_to(self.project_root))
+        rel_path = filepath.relative_to(self.project_root).as_posix()
         strategy = self._extractor_strategy(filepath)
         if strategy == "stylesheet":
             return self._extract_stylesheet(rel_path, code)
@@ -554,7 +554,7 @@ class CodeGraph:
 
     def _extract_with_tree_sitter(self, filepath: Path, code: str) -> dict:
         parser = self._get_tree_sitter_parser(filepath)
-        rel_path = str(filepath.relative_to(self.project_root))
+        rel_path = filepath.relative_to(self.project_root).as_posix()
         if parser is None:
             return {"entities": [], "relations": []}
         try:
@@ -612,7 +612,7 @@ class CodeGraph:
             structured = self._extract_structured(filepath, code)
             if structured.get("entities") or structured.get("relations"):
                 return structured, strategy
-        rel_path = str(filepath.relative_to(self.project_root))
+        rel_path = filepath.relative_to(self.project_root).as_posix()
         return await self.llm_extractor.extract(rel_path, code), "llm"
 
     def _store_extracted(self, rel_path: str, mtime: float, data: dict) -> None:
@@ -643,7 +643,7 @@ class CodeGraph:
     async def index_file(self, filepath: Path) -> None:
         if not self._file_needs_update(filepath):
             return
-        rel = str(filepath.relative_to(self.project_root))
+        rel = filepath.relative_to(self.project_root).as_posix()
         try:
             code = filepath.read_text(encoding="utf-8", errors="ignore")
             if len(code.strip()) < 50:
@@ -664,7 +664,7 @@ class CodeGraph:
             logger.warning("Failed to index %s: %s", filepath, e)
 
     async def reindex_file(self, filepath: Path) -> None:
-        rel = str(filepath.relative_to(self.project_root))
+        rel = filepath.relative_to(self.project_root).as_posix()
         self._delete_file_data(rel)
         await self.index_file(filepath)
         self._rebuild_faiss()
@@ -672,7 +672,7 @@ class CodeGraph:
     def get_build_status(self) -> dict:
         files = self._get_files()
         indexed_files = self._get_files_indexed()
-        existing_rel_paths = {str(p.relative_to(self.project_root)) for p in files}
+        existing_rel_paths = {p.relative_to(self.project_root).as_posix() for p in files}
         deleted_files = len(set(indexed_files) - existing_rel_paths)
         indexed_project_files = len(set(indexed_files) & existing_rel_paths)
         stale_files = sum(1 for f in files if self._file_needs_update(f))
@@ -899,7 +899,7 @@ class CodeGraph:
         results: list[dict] = []
         lowered = normalized.lower()
         for path in self._get_files():
-            rel_path = str(path.relative_to(self.project_root))
+            rel_path = path.relative_to(self.project_root).as_posix()
             try:
                 text = path.read_text(encoding="utf-8", errors="ignore")
             except Exception:

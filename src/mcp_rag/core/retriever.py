@@ -147,7 +147,7 @@ class MultiLangCodeRetriever:
                     if len(chunk.strip()) < 60:
                         continue
                     documents.append(chunk)
-                    file_paths.append(str(path.relative_to(self.root_dir)))
+                    file_paths.append(path.relative_to(self.root_dir).as_posix())
                     line_numbers.append(i + 1)
                     tokenized_corpus.append(self._tokenize_text(chunk))
             except Exception as e:
