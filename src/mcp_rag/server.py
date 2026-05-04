@@ -73,10 +73,14 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_build",
             description=(
-                "Build or refresh the project's code knowledge graph. "
-                "Indexes files via tree-sitter / regex (and an optional LLM fallback). "
-                "By default indexes every stale file in one call. "
-                "Run this before the first graph_* search."
+                "Build or refresh the per-project code knowledge graph. "
+                "Walks source via tree-sitter / regex extractors and stores "
+                "entities + relations in SQLite + FAISS. By default indexes "
+                "every stale file in one call. "
+                "Auto-runs on the first data-needing graph_* tool when the "
+                "graph is empty, so you usually don't call this directly — "
+                "only after large branch switches, after changing extractor "
+                "settings, or when graph_pending_files reports stale files."
             ),
             inputSchema={
                 "type": "object",
@@ -90,7 +94,13 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_index_file",
-            description="Re-index a single file. Use after editing one file when a full rebuild is overkill.",
+            description=(
+                "Re-index ONE file after edits. Useful when you've just "
+                "changed a single file and want its entities/relations "
+                "refreshed without sweeping the whole project. For a full "
+                "project refresh use graph_build (it's already incremental "
+                "via mtime check)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -102,8 +112,17 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_search",
             description=(
-                "Search graph entities by name (classes, functions, components, …). "
-                "Combines LIKE filtering with FAISS semantic re-ranking."
+                "Find entities by NAME (substring/multi-token match on the "
+                "entities table) with optional type filter. Returns a typed "
+                "list of declarations — classes, functions, methods, "
+                "components, etc. — that contain the query in their name. "
+                "Niche: 'list all classes with Button in the name', "
+                "'every use* hook', 'all *Provider components'.\n\n"
+                "NOT for concept search — descriptive queries like "
+                "'extract antd styles' return nothing because this matches "
+                "identifier text, not meaning. Use search_code for that.\n"
+                "NOT for refactor scope — for an exact name's call sites "
+                "use graph_find_usages."
             ),
             inputSchema={
                 "type": "object",
@@ -117,7 +136,14 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_find_usages",
-            description="Find every place an entity is referenced (use before refactor).",
+            description=(
+                "Every place an EXACT-named entity is referenced — calls, "
+                "JSX <Component> usages, instantiations, inheritance, "
+                "uses-as-property. Mode 'callers' narrows to calls only. "
+                "Run before rename/delete/refactor.\n\n"
+                "Needs the literal entity name. For partial-name discovery "
+                "use graph_search; for concept search use search_code."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -129,7 +155,13 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_get_file_deps",
-            description="List a file's dependencies — what it imports, inherits from, or uses.",
+            description=(
+                "Outgoing edges of a file: what it imports, inherits from, "
+                "or uses. Grouped by relation type.\n\n"
+                "graph_explain returns this PLUS the file's own declarations "
+                "PLUS external callers in one call. Prefer graph_explain "
+                "unless you specifically want only the deps section."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {"filepath": {"type": "string"}},
@@ -138,7 +170,14 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_file_structure",
-            description="Show all classes/functions/etc. defined in a file.",
+            description=(
+                "Bare list of declarations in a file (classes, functions, "
+                "methods, components, interfaces, types, …) with line "
+                "numbers.\n\n"
+                "graph_explain wraps this with deps and external callers. "
+                "Prefer graph_explain unless you need a stripped-down "
+                "list for further programmatic processing."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {"filepath": {"type": "string"}},
@@ -148,10 +187,15 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_get_subgraph",
             description=(
-                "BFS the graph around an entity up to the given depth. "
-                "Each node's relations are capped (per_node_cap) — common "
-                "names like Layout/Header otherwise return tens of thousands "
-                "of edges. Prefer unique entity names for useful results."
+                "BFS the relation graph around an entity, up to the given "
+                "depth. Returns reached entities + edges between them. "
+                "Each node's relations are capped (per_node_cap, default 50) "
+                "and overflowed nodes are listed under truncated_nodes so "
+                "the caller knows the result is partial.\n\n"
+                "Reliable on uniquely-named entities only. Common names "
+                "(Layout, Header, props, value) recur as `to_name` across "
+                "hundreds of files and produce mostly truncated_nodes — "
+                "use graph_find_usages for those instead."
             ),
             inputSchema={
                 "type": "object",
@@ -165,15 +209,24 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_stats",
-            description="Show graph statistics: file/entity/relation counts and entity types breakdown.",
+            description=(
+                "Counts (files, entities, relations) plus a per-type "
+                "breakdown. Quick freshness sanity check at session "
+                "start; pair with graph_pending_files to see *which* "
+                "files diverge."
+            ),
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="graph_pending_files",
             description=(
-                "List files where the graph and disk diverge: never-indexed, "
-                "stale (mtime changed), and missing (in graph but deleted on disk). "
-                "Useful to confirm coverage after graph_build."
+                "Three lists of files where the graph and disk diverge:\n"
+                "  unindexed — exist on disk, never indexed\n"
+                "  stale     — indexed but mtime has changed\n"
+                "  missing   — in the graph, deleted from disk\n"
+                "Use after graph_build to confirm coverage, or before a "
+                "session to decide whether to rebuild. `filter` does a "
+                "substring match on path, `limit` caps each category."
             ),
             inputSchema={
                 "type": "object",
@@ -186,11 +239,15 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_explain",
             description=(
-                "Compact one-shot view of a file: defined entities, "
-                "dependencies (what it imports/uses), and who calls its "
-                "exported functions/classes from elsewhere. Replaces calling "
-                "graph_file_structure + graph_get_file_deps + graph_find_usages "
-                "separately."
+                "Compact dossier on a file in one call:\n"
+                "  • Declarations defined in it (filtered to real "
+                "    class/function/component rows, regex noise dropped)\n"
+                "  • Dependencies grouped by relation (imports, uses, "
+                "    inherits)\n"
+                "  • External callers per defined entity\n\n"
+                "Default starting point when reading or about to edit a "
+                "file — replaces graph_file_structure + graph_get_file_deps "
+                "+ graph_find_usages in one round trip."
             ),
             inputSchema={
                 "type": "object",
@@ -204,11 +261,16 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_find_similar",
             description=(
-                "Find entities semantically nearest to a given one — "
-                "cross-file dedup detection. Use before writing a new "
-                "helper / component to check whether something close "
-                "already exists. Matches by meaning, not by name, so it "
-                "catches duplicates Grep and graph_search miss."
+                "Entities semantically nearest to a given anchor by FAISS "
+                "vector similarity. The embed text combines name + "
+                "outgoing relations digest + code snippet, so structural "
+                "fingerprints cluster (e.g. all antd-component wrappers "
+                "that `instantiate Ant*; call cn` end up close).\n\n"
+                "Run before writing a new helper or component to find an "
+                "existing one that does the same thing. Anchor must be "
+                "the name of an indexed entity. For text concept search "
+                "(no anchor) use search_code; for partial-name discovery "
+                "use graph_search."
             ),
             inputSchema={
                 "type": "object",
@@ -228,11 +290,16 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_dead_code",
             description=(
-                "List entities (functions, classes, methods, components) that "
-                "no relation in the graph points to — i.e. nothing in the indexed "
-                "code calls, uses, instantiates or inherits them. Refactor aid. "
-                "False positives: dynamic dispatch, public API entry points, "
-                "framework callbacks invoked via reflection."
+                "Definitions (function/method/class/component/interface) "
+                "that no relation in the graph points at — i.e. nothing in "
+                "the indexed code calls, uses, instantiates, or inherits "
+                "them. Refactor candidates.\n\n"
+                "Pass exclude_paths globs (e.g. ['demoapp/*', "
+                "'**/*.stories.*']) to hide scaffolding/sample code where "
+                "no-usages is expected. Known false positives in any "
+                "codebase: dynamic dispatch, public API entry points, "
+                "framework callbacks wired by string name (event handlers, "
+                "DI tokens, route handlers)."
             ),
             inputSchema={
                 "type": "object",
@@ -253,15 +320,32 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="graph_clear",
-            description="Wipe the knowledge graph for the current project.",
+            description=(
+                "Wipe the knowledge graph for this project. Destructive — "
+                "the next data-needing graph_* call will trigger a full "
+                "rebuild via auto-build. Use only when changing extractor "
+                "settings, switching embedding models with different "
+                "dimensions, or troubleshooting suspected corruption. "
+                "graph_build is incremental, so this is rarely needed."
+            ),
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="search_code",
             description=(
-                "Hybrid semantic+lexical search over project source. "
-                "BM25 for exact tokens, dense embeddings for concepts. "
-                "Best for 'where is the auth flow', 'how do we serialize X', etc."
+                "Hybrid lexical + semantic search OVER CODE TEXT (not the "
+                "entity table). Stack: BM25 → dense embeddings (bge-m3) → "
+                "cross-encoder rerank → IDF-weighted bonus for kebab/snake/"
+                "dotted/Camel literals the user typed verbatim. Mixed "
+                "RU/EN queries supported.\n\n"
+                "Default tool for concept questions ('how does theming "
+                "work', 'where is the auth flow'), pattern hunting, and "
+                "any query where you don't know the exact entity name. "
+                "Returns code chunks with file/lines/score.\n\n"
+                "For an exact entity name's references → graph_find_usages. "
+                "For partial-name discovery in the entity registry → "
+                "graph_search. For an indexed entity's nearest neighbors → "
+                "graph_find_similar."
             ),
             inputSchema={
                 "type": "object",
@@ -275,7 +359,15 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="memory_add",
-            description="Persist a fact about this project (preferences, conventions, decisions).",
+            description=(
+                "Persist a fact about this project (decision, convention, "
+                "DTO shape, operational note). Stored per project root, "
+                "indexed for hybrid search. Returns the memory id.\n\n"
+                "If you already track project notes in another system "
+                "(Claude Code's local memory, Obsidian, etc.), prefer that "
+                "and skip this — mcp-rag memory is most useful when "
+                "multiple tools/IDEs share the same MCP server."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -288,7 +380,12 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="memory_search",
-            description="Hybrid search over stored memories.",
+            description=(
+                "Hybrid BM25 + dense search across stored project "
+                "memories. Optional filter by memory_type. Top score "
+                "with a wide gap to the runner-up usually means a clean "
+                "hit; flat distribution means no real match."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -301,7 +398,10 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="memory_list",
-            description="List all memories, optionally filtered by type.",
+            description=(
+                "List all stored memories for this project, optionally "
+                "filtered by memory_type. Useful for review and curation."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {"memory_type": {"type": "string"}},
@@ -309,7 +409,12 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="memory_delete",
-            description="Delete a memory by id, or every memory whose content contains the given query.",
+            description=(
+                "Remove a single memory by its id, or — if `query` is "
+                "given instead — every memory whose content contains that "
+                "substring (case-insensitive). Pass exactly one of the "
+                "two."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -320,7 +425,10 @@ def _build_tools() -> list[Tool]:
         ),
         Tool(
             name="memory_clear",
-            description="Delete all memories for this project.",
+            description=(
+                "Wipe all memories for this project. Destructive and "
+                "non-reversible — use only when starting over."
+            ),
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
