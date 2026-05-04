@@ -640,15 +640,24 @@ class CodeGraph:
                 (rel_path, mtime),
             )
 
+    def _mark_file_seen(self, rel: str, mtime: float) -> None:
+        """Record file_meta without entities so the file isn't considered stale forever."""
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO file_meta(file, mtime, indexed) VALUES(?,?,1)",
+                (rel, mtime),
+            )
+
     async def index_file(self, filepath: Path) -> None:
         if not self._file_needs_update(filepath):
             return
         rel = filepath.relative_to(self.project_root).as_posix()
         try:
             code = filepath.read_text(encoding="utf-8", errors="ignore")
-            if len(code.strip()) < 50:
-                return
             mtime = filepath.stat().st_mtime
+            if len(code.strip()) < 50:
+                self._mark_file_seen(rel, mtime)
+                return
             self._delete_file_data(rel)
             raw_data, strategy = await self._extract_with_strategy(filepath, code)
             data = self._sanitize_extracted(rel, raw_data)
@@ -659,7 +668,7 @@ class CodeGraph:
                 logger.info("Indexed %s: %d entities, %d relations [%s]",
                             rel, entities_count, relations_count, strategy)
             else:
-                logger.warning("Skipped %s: extractor=%s returned empty result", rel, strategy)
+                logger.warning("Skipped %s: extractor=%s returned empty result (will retry next build)", rel, strategy)
         except Exception as e:
             logger.warning("Failed to index %s: %s", filepath, e)
 
@@ -685,15 +694,32 @@ class CodeGraph:
             "needs_build": stale_files > 0 or deleted_files > 0,
         }
 
+    def get_pending_files(self) -> dict:
+        """List files that don't match the graph: never indexed, stale, or deleted on disk."""
+        files = self._get_files()
+        indexed = set(self._get_files_indexed())
+        existing = {p.relative_to(self.project_root).as_posix(): p for p in files}
+
+        unindexed: list[str] = []
+        stale: list[str] = []
+        for rel, path in existing.items():
+            if rel not in indexed:
+                unindexed.append(rel)
+            elif self._file_needs_update(path):
+                stale.append(rel)
+
+        missing = sorted(indexed - set(existing.keys()))
+        return {
+            "unindexed": sorted(unindexed),
+            "stale": sorted(stale),
+            "missing": missing,
+        }
+
     async def build(self, max_files: Optional[int] = None) -> dict:
         """Index every stale file by default. Pass ``max_files`` to cap one call."""
         self._is_building = True
         try:
             t0 = time.time()
-            with sqlite3.connect(self.db_path) as con:
-                con.execute(
-                    "DELETE FROM file_meta WHERE file NOT IN (SELECT DISTINCT file FROM entities)"
-                )
             files = self._get_files()
             t1 = time.time()
             logger.info("Graph file scan: %d files in %.2fs", len(files), t1 - t0)

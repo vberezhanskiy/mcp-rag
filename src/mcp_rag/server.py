@@ -161,6 +161,21 @@ def _build_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
+            name="graph_pending_files",
+            description=(
+                "List files where the graph and disk diverge: never-indexed, "
+                "stale (mtime changed), and missing (in graph but deleted on disk). "
+                "Useful to confirm coverage after graph_build."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 200, "description": "Cap per category"},
+                    "filter": {"type": "string", "description": "Optional substring filter applied to paths"},
+                },
+            },
+        ),
+        Tool(
             name="graph_clear",
             description="Wipe the knowledge graph for the current project.",
             inputSchema={"type": "object", "properties": {}},
@@ -354,6 +369,42 @@ async def _dispatch(services: Services, name: str, args: dict) -> str:
                 lines.append(f"    - {t}: {c}")
         if stats["entities"] == 0 and not g.is_building:
             lines.append("\nGraph is empty. Run graph_build first.")
+        return "\n".join(lines)
+
+    if name == "graph_pending_files":
+        pending = g.get_pending_files()
+        limit = max(1, int(args.get("limit", 200)))
+        flt = (args.get("filter") or "").lower()
+
+        def pick(items: list[str]) -> list[str]:
+            picked = [p for p in items if flt in p.lower()] if flt else items
+            return picked[:limit]
+
+        unindexed = pick(pending["unindexed"])
+        stale = pick(pending["stale"])
+        missing = pick(pending["missing"])
+        total = len(pending["unindexed"]) + len(pending["stale"]) + len(pending["missing"])
+        if total == 0:
+            return "Graph is fully in sync with disk."
+
+        lines = [
+            f"Pending vs disk — unindexed={len(pending['unindexed'])}, "
+            f"stale={len(pending['stale'])}, missing={len(pending['missing'])}"
+        ]
+        if flt:
+            lines[0] += f"  (filter={flt!r})"
+        for label, items, full in (
+            ("Unindexed (never built)", unindexed, pending["unindexed"]),
+            ("Stale (mtime changed)", stale, pending["stale"]),
+            ("Missing (gone from disk)", missing, pending["missing"]),
+        ):
+            if not items:
+                continue
+            lines.append(f"\n{label} ({len(items)} of {len(full)}):")
+            for p in items:
+                lines.append(f"  • {p}")
+            if len(items) < len(full):
+                lines.append(f"  … {len(full) - len(items)} more — raise limit or use filter")
         return "\n".join(lines)
 
     if name == "graph_clear":
