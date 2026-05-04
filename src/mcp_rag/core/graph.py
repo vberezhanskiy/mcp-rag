@@ -802,16 +802,30 @@ class CodeGraph:
         finally:
             self._is_building = False
 
+    @staticmethod
+    def _faiss_entity_text(name: str, description: Optional[str], snippet: Optional[str]) -> str:
+        """Build the text we feed into FAISS for one entity.
+
+        Prefer the actual code snippet — it carries semantics that bare
+        identifiers don't. Fall back to description for entities without
+        a snippet (file-level "module" rows, etc.). Cap length so long
+        functions don't dominate the encoding pipeline.
+        """
+        snip = (snippet or "").strip()
+        if snip:
+            return f"{name}\n{snip[:500]}"
+        return f"{name} {(description or '').strip()}"
+
     def _rebuild_faiss(self) -> None:
         try:
             import faiss
             with sqlite3.connect(self.db_path) as con:
-                rows = con.execute("SELECT name, description FROM entities").fetchall()
+                rows = con.execute("SELECT name, description, snippet FROM entities").fetchall()
             if not rows:
                 self.faiss_index = None
                 self.faiss_names = []
                 return
-            texts = [f"{r[0]} {r[1] or ''}" for r in rows]
+            texts = [self._faiss_entity_text(r[0], r[1], r[2]) for r in rows]
             self.faiss_names = [r[0] for r in rows]
             embeddings = encode_documents(
                 texts, normalize_embeddings=True,
@@ -897,13 +911,36 @@ class CodeGraph:
 
     @staticmethod
     def _extract_tree_sitter_name(node, source: bytes) -> str:
+        # `const Flex = ...` parses as lexical_declaration → variable_declarator
+        # → name. The old fallback loop grabbed the leading "const"/"let"
+        # keyword as the entity name, so every const/let declaration ended up
+        # in the graph as "const"/"let" instead of its real identifier. Find
+        # the declarator child first and read its `name` field.
+        if node.type in ("lexical_declaration", "variable_declaration"):
+            for child in node.children:
+                if child.type in ("variable_declarator", "init_declarator"):
+                    name_node = child.child_by_field_name("name")
+                    if name_node is None:
+                        # Some grammars expose the identifier as a positional
+                        # child rather than a named field.
+                        for grand in child.children:
+                            if grand.type in ("identifier", "property_identifier", "type_identifier"):
+                                name_node = grand
+                                break
+                    if name_node is not None:
+                        return source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore").strip()
         for field_name in _TREE_SITTER_NAME_FIELDS:
             child = node.child_by_field_name(field_name)
             if child is not None:
                 return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore").strip()
+        # Last-resort identifier scan, but skip the variable-declaration
+        # keywords that tripped the old logic.
+        skip = {"const", "let", "var", "function", "class", "type", "interface", "enum"}
         for child in node.children:
             child_text = source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore").strip()
-            if child_text and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$]*", child_text):
+            if not child_text or child_text in skip:
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$]*", child_text):
                 return child_text
         return ""
 
@@ -1158,6 +1195,15 @@ class CodeGraph:
             ).fetchall()
         return {"files": f, "entities": e, "relations": r, "by_type": {t: c for t, c in types}}
 
+    # Types whose snippets carry actual definition semantics. Imports and
+    # property/symbol references usually point at one line of an import
+    # statement, so their snippets pick up sibling tokens (other imports
+    # on the same line) and pollute similarity rankings.
+    _PRIMARY_DEF_TYPES = frozenset({
+        "class", "function", "method", "component",
+        "interface", "enum", "type", "hook",
+    })
+
     def find_similar_entities(
         self,
         entity_name: str,
@@ -1171,9 +1217,13 @@ class CodeGraph:
         this?" Cross-checks neither Grep nor name-substring search can
         answer because matches are by *meaning*, not lexical overlap.
 
-        The query entity is excluded from results; same-name results in
-        other files are kept (they ARE the dupes we're hunting).
+        The anchor and the candidates are filtered to "real definitions"
+        (class/function/method/component/...) by default so that import
+        rows whose snippet is just `import { A, B, C }` don't drag in
+        their co-imported siblings.
         """
+        if self.faiss_index is None or not self.faiss_names:
+            self._rebuild_faiss()
         if self.faiss_index is None or not self.faiss_names:
             return {
                 "anchor": entity_name,
@@ -1181,31 +1231,40 @@ class CodeGraph:
                 "warning": "Graph FAISS index is empty — run graph_build first.",
             }
 
-        # Pull the canonical (name, description) text for the anchor so we
-        # encode the same shape the index was built from.
+        type_filter = set(entity_types) if entity_types else set(self._PRIMARY_DEF_TYPES)
+
+        # Pick the best anchor row: prefer entries whose type lands in the
+        # filter set AND whose description marks a real declaration ("Extracted
+        # from <node>") over a regex sweep ("Referenced call target").
+        primary_marker = ",".join("?" * len(type_filter)) if type_filter else "''"
         with sqlite3.connect(self.db_path) as con:
             row = con.execute(
-                "SELECT name, description FROM entities WHERE name = ? "
-                "ORDER BY CASE WHEN description = '' THEN 1 ELSE 0 END LIMIT 1",
-                (entity_name,),
+                f"""
+                SELECT name, description, snippet, type FROM entities
+                WHERE name = ?
+                ORDER BY
+                  CASE WHEN type IN ({primary_marker}) THEN 0 ELSE 1 END,
+                  CASE WHEN description LIKE 'Extracted from%' THEN 0 ELSE 1 END,
+                  CASE WHEN snippet IS NULL OR snippet = '' THEN 1 ELSE 0 END
+                LIMIT 1
+                """,
+                (entity_name, *type_filter) if type_filter else (entity_name,),
             ).fetchone()
         if not row:
             return {"anchor": entity_name, "results": [], "warning": f"Entity {entity_name!r} not in graph."}
-        anchor_text = f"{row[0]} {row[1] or ''}"
+        anchor_text = self._faiss_entity_text(row[0], row[1], row[2])
 
-        # Encode and probe the index. We pull more candidates than the
-        # caller asked for so we can drop anchor-self and below-threshold
-        # hits and still hand back a full list.
+        # Pull more raw FAISS hits than the caller asked for so we have
+        # enough headroom to drop self/below-threshold/wrong-type rows.
         try:
             q_vec = encode_query([anchor_text], normalize_embeddings=True,
                                  show_progress_bar=False).astype("float32")
-            k = min(self.faiss_index.ntotal, max(limit * 4, 40))
+            k = min(self.faiss_index.ntotal, max(limit * 8, 80))
             scores, indices = self.faiss_index.search(q_vec, k)
         except Exception as e:
             logger.warning("find_similar_entities: FAISS query failed: %s", e)
             return {"anchor": entity_name, "results": [], "warning": str(e)}
 
-        type_filter = set(entity_types) if entity_types else None
         seen: set[tuple[str, str]] = set()
         results: list[dict] = []
         with sqlite3.connect(self.db_path) as con:
@@ -1217,16 +1276,25 @@ class CodeGraph:
                 cand_name = self.faiss_names[idx]
                 if cand_name == entity_name:
                     continue
+                # Prefer the best instance of this name — same ordering as
+                # the anchor pick so the candidate row reflects a real
+                # declaration, not an import-line hit.
                 row = con.execute(
-                    "SELECT file, name, type, description, line_start, line_end, snippet "
-                    "FROM entities WHERE name = ? "
-                    "ORDER BY CASE WHEN line_start IS NULL THEN 1 ELSE 0 END, file, line_start "
-                    "LIMIT 1",
-                    (cand_name,),
+                    f"""
+                    SELECT file, name, type, description, line_start, line_end, snippet
+                    FROM entities WHERE name = ?
+                    ORDER BY
+                      CASE WHEN type IN ({','.join('?' * len(type_filter))}) THEN 0 ELSE 1 END,
+                      CASE WHEN description LIKE 'Extracted from%' THEN 0 ELSE 1 END,
+                      CASE WHEN line_start IS NULL THEN 1 ELSE 0 END,
+                      file, line_start
+                    LIMIT 1
+                    """,
+                    (cand_name, *type_filter),
                 ).fetchone()
                 if not row:
                     continue
-                if type_filter and row[2] not in type_filter:
+                if row[2] not in type_filter:
                     continue
                 key = (row[0], row[1])
                 if key in seen:
