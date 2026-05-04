@@ -243,6 +243,11 @@ def _build_tools() -> list[Tool]:
                         "description": "Filter by types (default: function, method, class, component, interface)",
                     },
                     "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                    "exclude_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional fnmatch globs to skip (e.g. ['demoapp/*', '**/*.stories.*']) — useful for hiding scaffolding where no-usages is expected.",
+                    },
                 },
             },
         ),
@@ -391,13 +396,19 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return f"Indexed {rel}: {len(entities)} entities."
 
     if name == "graph_search":
+        q = args["query"]
         results = g.search_entity(
-            args["query"],
+            q,
             entity_type=args.get("entity_type") or None,
             limit=int(args.get("limit", 15)),
         )
         if not results:
-            return f"No entities found for {args['query']!r}."
+            return (
+                f"No entities found by name for {q!r}.\n\n"
+                f"graph_search matches identifiers (class/function/component "
+                f"names). For concept search across code, run search_code "
+                f"with the same query."
+            )
         lines = [f"Found {len(results)} entities:"]
         for r in results:
             lines.extend(g.format_entity_result(r))
@@ -596,7 +607,8 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
     if name == "graph_dead_code":
         types = args.get("entity_types") or None
         limit = max(1, min(int(args.get("limit", 50)), 500))
-        results = g.find_dead_code(entity_types=types, limit=limit)
+        exclude_paths = args.get("exclude_paths") or None
+        results = g.find_dead_code(entity_types=types, limit=limit, exclude_paths=exclude_paths)
         if not results:
             return "No dead code found (every defined entity is referenced somewhere)."
         lines = [

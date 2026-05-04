@@ -807,30 +807,86 @@ class CodeGraph:
             self._is_building = False
 
     @staticmethod
-    def _faiss_entity_text(name: str, description: Optional[str], snippet: Optional[str]) -> str:
+    def _summarize_relations(rels: list[tuple[str, str]], cap_per_rel: int = 6) -> str:
+        """Compact one-line digest of an entity's outgoing relations.
+
+        ``rels`` is a list of (relation, to_name) tuples. We dedup, group
+        by relation type, and cap each group so the embed text stays
+        bounded. Output looks like:
+            "instantiates AntFlex, FlexProps; calls cn; uses className"
+        """
+        if not rels:
+            return ""
+        by_rel: dict[str, list[str]] = {}
+        for rel, target in rels:
+            bucket = by_rel.setdefault(rel, [])
+            if target not in bucket:
+                bucket.append(target)
+        parts = []
+        for rel in ("instantiates", "calls", "inherits", "uses", "imports", "defines"):
+            if rel not in by_rel:
+                continue
+            targets = by_rel[rel][:cap_per_rel]
+            parts.append(f"{rel} {', '.join(targets)}")
+        return "; ".join(parts)
+
+    @classmethod
+    def _faiss_entity_text(
+        cls,
+        name: str,
+        description: Optional[str],
+        snippet: Optional[str],
+        relations: Optional[list[tuple[str, str]]] = None,
+    ) -> str:
         """Build the text we feed into FAISS for one entity.
 
-        Prefer the actual code snippet — it carries semantics that bare
-        identifiers don't. Fall back to description for entities without
-        a snippet (file-level "module" rows, etc.). Cap length so long
-        functions don't dominate the encoding pipeline.
+        Layered context:
+        - name (always)
+        - relation digest if available — gives short generic names like
+          ``Flex`` a structural fingerprint (instantiates AntFlex, calls
+          cn) so FAISS can place them near other wrappers
+        - snippet (capped) if available — actual code semantics
+        - description as a last-resort fallback for module-level rows
         """
+        parts: list[str] = [name]
+        rel_summary = cls._summarize_relations(relations or [])
+        if rel_summary:
+            parts.append(rel_summary)
         snip = (snippet or "").strip()
         if snip:
-            return f"{name}\n{snip[:500]}"
-        return f"{name} {(description or '').strip()}"
+            parts.append(snip[:400])
+        elif description:
+            parts.append((description or "").strip())
+        return "\n".join(parts)
 
     def _rebuild_faiss(self) -> None:
         try:
             import faiss
             with sqlite3.connect(self.db_path) as con:
-                rows = con.execute("SELECT name, description, snippet FROM entities").fetchall()
+                rows = con.execute(
+                    "SELECT file, name, description, snippet FROM entities"
+                ).fetchall()
+                # Pre-load all relations grouped by (file, from_name) so the
+                # per-entity lookup is O(1) instead of O(N²) sub-queries.
+                rels_rows = con.execute(
+                    "SELECT file, from_name, relation, to_name FROM relations"
+                ).fetchall()
             if not rows:
                 self.faiss_index = None
                 self.faiss_names = []
                 return
-            texts = [self._faiss_entity_text(r[0], r[1], r[2]) for r in rows]
-            self.faiss_names = [r[0] for r in rows]
+            from collections import defaultdict
+            rels_map: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+            for f, fn, r, tn in rels_rows:
+                rels_map[(f, fn)].append((r, tn))
+            texts = [
+                self._faiss_entity_text(
+                    r[1], r[2], r[3],
+                    relations=rels_map.get((r[0], r[1]), []),
+                )
+                for r in rows
+            ]
+            self.faiss_names = [r[1] for r in rows]
             embeddings = encode_documents(
                 texts, normalize_embeddings=True,
                 show_progress_bar=False, batch_size=encode_batch_size(),
@@ -838,7 +894,7 @@ class CodeGraph:
             dim = embeddings.shape[1]
             self.faiss_index = faiss.IndexFlatIP(dim)
             self.faiss_index.add(embeddings)
-            logger.info("FAISS index built: %d entities", len(self.faiss_names))
+            logger.info("FAISS index built: %d entities (rels-enriched)", len(self.faiss_names))
         except Exception as e:
             self.faiss_index = None
             self.faiss_names = []
@@ -1244,7 +1300,7 @@ class CodeGraph:
         with sqlite3.connect(self.db_path) as con:
             row = con.execute(
                 f"""
-                SELECT name, description, snippet, type FROM entities
+                SELECT file, name, description, snippet, type FROM entities
                 WHERE name = ?
                 ORDER BY
                   CASE WHEN type IN ({primary_marker}) THEN 0 ELSE 1 END,
@@ -1254,9 +1310,19 @@ class CodeGraph:
                 """,
                 (entity_name, *type_filter) if type_filter else (entity_name,),
             ).fetchone()
-        if not row:
-            return {"anchor": entity_name, "results": [], "warning": f"Entity {entity_name!r} not in graph."}
-        anchor_text = self._faiss_entity_text(row[0], row[1], row[2])
+            if not row:
+                return {"anchor": entity_name, "results": [], "warning": f"Entity {entity_name!r} not in graph."}
+            anchor_file, anchor_name, anchor_desc, anchor_snip, _ = row
+            # Same shape used by _rebuild_faiss so the anchor sits in the
+            # same vector space as the candidates.
+            rels_rows = con.execute(
+                "SELECT relation, to_name FROM relations WHERE file = ? AND from_name = ?",
+                (anchor_file, anchor_name),
+            ).fetchall()
+        anchor_text = self._faiss_entity_text(
+            anchor_name, anchor_desc, anchor_snip,
+            relations=[(r[0], r[1]) for r in rels_rows],
+        )
 
         # Pull more raw FAISS hits than the caller asked for so we have
         # enough headroom to drop self/below-threshold/wrong-type rows.
@@ -1322,14 +1388,23 @@ class CodeGraph:
         self,
         entity_types: Optional[list[str]] = None,
         limit: int = 50,
+        exclude_paths: Optional[list[str]] = None,
     ) -> list[dict]:
         """Entities that no relation points to — never called, used, or instantiated.
 
         Defaults to functions/methods/classes/components since "dead" import
         or property symbols are usually external references, not local defs.
+
+        ``exclude_paths`` is an optional list of fnmatch globs (e.g.
+        ``["demoapp/*", "**/*.stories.*"]``) — file paths matching any
+        glob are dropped from the result. Useful for skipping legitimate
+        scaffolding/comparison code where "no usages" is expected.
         """
         types = entity_types or ["function", "method", "class", "component", "interface"]
         placeholders = ",".join("?" * len(types))
+        # Pull a wider window than ``limit`` so post-filtering by
+        # exclude_paths still leaves a full result set.
+        sql_limit = limit * 5 if exclude_paths else limit
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute(
                 f"""
@@ -1344,12 +1419,17 @@ class CodeGraph:
                 ORDER BY e.file, e.line_start
                 LIMIT ?
                 """,
-                (*types, limit),
+                (*types, sql_limit),
             ).fetchall()
+
+        if exclude_paths:
+            from fnmatch import fnmatch
+            rows = [r for r in rows if not any(fnmatch(r[0], g) for g in exclude_paths)]
+
         return [
             {"file": r[0], "name": r[1], "type": r[2], "description": r[3],
              "line_start": r[4], "line_end": r[5], "snippet": r[6] or ""}
-            for r in rows
+            for r in rows[:limit]
         ]
 
     def explain_file(self, rel_path: str, top_callers: int = 5) -> dict:
