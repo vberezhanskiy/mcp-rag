@@ -257,6 +257,23 @@ class MultiLangCodeRetriever:
         self.cache.clear()
         self._build_index()
 
+    @staticmethod
+    def _query_literals(query: str) -> list[str]:
+        """Extract identifier-shaped literals from a query.
+
+        Catches kebab-case (epcp-flex), snake_case (use_user_store),
+        dotted (data.api.url), and CamelCase (FlexProps) — the kinds
+        of tokens BM25 splits but that the user almost certainly typed
+        because the exact substring exists in code.
+        """
+        kebab_or_snake = re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)+", query)
+        camel = re.findall(r"\b[a-z]+(?:[A-Z][a-z0-9]+)+\b|\b[A-Z][a-z]+(?:[A-Z][a-z0-9]+)+\b", query)
+        out: list[str] = []
+        for tok in kebab_or_snake + camel:
+            if len(tok) >= 4 and tok.lower() not in {t.lower() for t in out}:
+                out.append(tok)
+        return out
+
     def search(
         self,
         query: str,
@@ -281,35 +298,52 @@ class MultiLangCodeRetriever:
             if idx != -1:
                 dense_score_map[int(idx)] = float(dscore)
 
+        # Identifier-shaped substrings (kebab/snake/dot/Camel) are nearly
+        # always intentional — pre-collect chunks that contain them so
+        # they're guaranteed to enter the rerank pool even if BM25's
+        # tokenizer dismantled the literal.
+        literals = self._query_literals(query)
+        literal_hits: set[int] = set()
+        if literals:
+            lits_lower = [l.lower() for l in literals]
+            for idx, chunk in enumerate(self.chunks):
+                cl = chunk.lower()
+                if any(l in cl for l in lits_lower):
+                    literal_hits.add(idx)
+
         candidates: Dict[int, Tuple[str, str, int, float]] = {}
-        all_ids = set(int(i) for i in bm25_top) | set(dense_score_map.keys())
+        all_ids = set(int(i) for i in bm25_top) | set(dense_score_map.keys()) | literal_hits
         for idx in all_ids:
             bm25_norm = bm25_scores[idx] / max_bm25 if idx < len(bm25_scores) else 0.0
             dense_norm = dense_score_map.get(idx, 0.0)
             combined = 0.5 * bm25_norm + 0.5 * dense_norm
             candidates[idx] = (self.chunks[idx], self.file_paths[idx], self.line_numbers[idx], combined)
 
-        # Take a wider candidate pool so the cross-encoder has something to
-        # rerank meaningfully — too narrow and the bi-encoder's ranking
-        # locks in noise.
-        rerank_pool = max(top_k_final * 4, 20)
+        # Wider rerank pool — top_k * 8 — keeps literal-hit chunks reachable
+        # even when BM25 ranks them low because the unique substring was
+        # tokenized away.
+        rerank_pool = max(top_k_final * 8, 60)
         sorted_cands = sorted(candidates.items(), key=lambda x: x[1][3], reverse=True)[:rerank_pool]
         if not sorted_cands:
             return "Nothing relevant found."
 
         if rerank_enabled() and len(sorted_cands) > 1:
-            # Blend the cross-encoder's semantic score with the original
-            # bm25+dense hybrid so exact-token matches (e.g. unique class
-            # names, kebab-case literals) keep some weight. Pure CE
-            # ranking otherwise outranks a literal hit by something that's
-            # only thematically related.
             chunks_for_rerank = [c[1][0] for c in sorted_cands]
             ranked = rerank(query, chunks_for_rerank, top_k=None)
             ce_by_pos = {pos: float(score) for pos, score in ranked}
             blended: list = []
+            lits_lower = [l.lower() for l in literals]
             for pos, (chunk_idx, (chunk, path, line, hybrid_score)) in enumerate(sorted_cands):
                 ce = ce_by_pos.get(pos, 0.0)
-                final = 0.65 * ce + 0.35 * float(hybrid_score)
+                # Blend cross-encoder + bm25/dense hybrid + literal bonus.
+                # CE leads on concept queries; the hybrid term keeps exact-
+                # token matches alive; the literal bonus surfaces chunks
+                # carrying user-typed kebab/snake/dotted/Camel identifiers.
+                bonus = 0.0
+                if lits_lower:
+                    cl = chunk.lower()
+                    bonus = 0.15 * sum(1 for l in lits_lower if l in cl)
+                final = 0.65 * ce + 0.35 * float(hybrid_score) + bonus
                 blended.append((chunk_idx, (chunk, path, line, final)))
             blended.sort(key=lambda x: x[1][3], reverse=True)
             sorted_cands = blended[:top_k_final]
