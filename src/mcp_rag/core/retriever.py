@@ -20,7 +20,7 @@ from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 import gitignore_parser
 
-from .embedder import _embed_model_id, encode_batch_size, get_embedder
+from .embedder import _embed_model_id, encode_batch_size, encode_documents, encode_query
 from .formatter import format_code_result
 
 logger = logging.getLogger(__name__)
@@ -128,7 +128,6 @@ class MultiLangCodeRetriever:
         import time
         t0 = time.time()
         logger.info("Building hybrid index for %s", self.root_dir)
-        embedder = get_embedder()
 
         files = self._iter_indexable_files()
         logger.info("Found %d files in %.2fs", len(files), time.time() - t0)
@@ -178,7 +177,7 @@ class MultiLangCodeRetriever:
         self.bm25 = BM25Okapi(tokenized_corpus)
 
         logger.info("Generating embeddings for %d chunks…", len(documents))
-        embeddings = embedder.encode(
+        embeddings = encode_documents(
             documents,
             normalize_embeddings=True,
             show_progress_bar=True,
@@ -258,8 +257,6 @@ class MultiLangCodeRetriever:
         top_k_final: int = 8,
         max_chunk_preview: int = 1500,
     ) -> str:
-        embedder = get_embedder()
-
         if not self.bm25 or not self.faiss_index:
             return "Code index is empty — no source files were found in the project."
 
@@ -267,7 +264,7 @@ class MultiLangCodeRetriever:
         bm25_scores = self.bm25.get_scores(tokenized_query)
         bm25_top = np.argsort(bm25_scores)[::-1][:top_k_initial]
 
-        q_emb = embedder.encode([query], normalize_embeddings=True)
+        q_emb = encode_query([query], normalize_embeddings=True)
         dense_scores, dense_indices = self.faiss_index.search(q_emb.astype("float32"), top_k_initial)
 
         max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0

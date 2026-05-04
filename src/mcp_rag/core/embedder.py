@@ -6,17 +6,19 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-# Default: BAAI/bge-m3 — multilingual top-tier (100+ languages incl. RU/EN),
-# 568M params (~1.2GB), 8k context, 1024-dim, no query/passage prefix
-# gymnastics, mature in sentence-transformers. Override per-instance with
-# the MCP_RAG_EMBED_MODEL env var.
-DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+# Default: Qwen/Qwen3-Embedding-0.6B — released June 2025. 0.6B params,
+# 1024-dim (flexible 32–1024 via Matryoshka), 32k context, 100+ languages,
+# Apache 2.0. MTEB Multilingual 64.33 vs bge-m3 59.56 at the same size
+# class. Encoding queries requires the registered "query" prompt; documents
+# encode as-is. Override via MCP_RAG_EMBED_MODEL.
+DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 # GPUs love bigger batches; bge-m3 is a heavier model than MiniLM though, so
 # we scale a bit more conservatively than for the previous tiny default.
@@ -96,11 +98,17 @@ def get_embedder() -> SentenceTransformer:
 
 
 def _param_bucket_for_active_model() -> str:
-    """Rough param-count bucket so batch size shrinks for heavy models."""
+    """Rough param-count bucket so batch size shrinks for heavy models.
+
+    Order matters: the small/base check has to win against the substring
+    fallback for "large" — otherwise '0.6b' triggers '6b' and a 600M model
+    gets the 8B batch budget (we'd ship under-batched on a 16 GB GPU).
+    """
     model_id = _embed_model_id().lower()
-    # Heuristics — we'd rather under-batch than OOM. Look at the loaded model
-    # only after first init; before that, infer from the id.
-    if any(tag in model_id for tag in ("8b", "7b", "6b", "4b", "large", "-l-", "-xl-")):
+    # Sub-1B variants first.
+    if any(tag in model_id for tag in ("0.6b", "0.5b", "300m", "embeddinggemma")):
+        return "base"
+    if any(tag in model_id for tag in ("8b", "7b", "4b", " 6b", "-6b", "_6b", "large", "-l-", "-xl-")):
         return "large"
     if any(tag in model_id for tag in ("base", "bge-m3", "mpnet", "e5-base")):
         return "base"
@@ -112,3 +120,28 @@ def encode_batch_size() -> int:
     device = _detect_device()
     bucket = _param_bucket_for_active_model()
     return _BATCH_SIZES_BY_PARAM_BUCKET.get((bucket, device), 32)
+
+
+def _has_prompt(embedder: SentenceTransformer, name: str) -> bool:
+    prompts = getattr(embedder, "prompts", None) or {}
+    return name in prompts
+
+
+def encode_query(texts, **kwargs) -> np.ndarray:
+    """Encode user-side queries.
+
+    Some models (Qwen3-Embedding, e5) lift quality 1-5% when queries are
+    encoded with a registered "query" prompt while documents go through
+    raw. We pass `prompt_name="query"` only when the model actually has
+    that prompt registered — otherwise we encode as-is so the helper is
+    safe to call with any model.
+    """
+    embedder = get_embedder()
+    if _has_prompt(embedder, "query"):
+        kwargs.setdefault("prompt_name", "query")
+    return embedder.encode(texts, **kwargs)
+
+
+def encode_documents(texts: Iterable[str], **kwargs) -> np.ndarray:
+    """Encode passages/entities/chunks. Always raw, no prompt."""
+    return get_embedder().encode(texts, **kwargs)

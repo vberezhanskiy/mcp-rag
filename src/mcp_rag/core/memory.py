@@ -15,7 +15,7 @@ import numpy as np
 from diskcache import Cache
 from rank_bm25 import BM25Okapi
 
-from .embedder import get_embedder
+from .embedder import _embed_model_id, encode_documents, encode_query
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +103,13 @@ class MemorySystem:
             logger.error("Failed to save memories: %s", e)
 
     def _get_embedding(self, text: str) -> np.ndarray:
-        key = f"emb:{hashlib.md5(text.encode()).hexdigest()}"
+        # Cache key includes the model id so a model swap doesn't return
+        # vectors with a stale dimension.
+        key = f"emb:{_embed_model_id()}:{hashlib.md5(text.encode()).hexdigest()}"
         cached = self.cache.get(key)
         if cached is not None:
             return np.frombuffer(cached, dtype="float32")
-        embedder = get_embedder()
-        vec = embedder.encode([text], normalize_embeddings=True, show_progress_bar=False)[0]
+        vec = encode_documents([text], normalize_embeddings=True, show_progress_bar=False)[0]
         self.cache.set(key, vec.astype("float32").tobytes())
         return vec.astype("float32")
 
@@ -213,10 +214,9 @@ class MemorySystem:
         if self.bm25 is None or self.faiss_index is None:
             return []
 
-        embedder = get_embedder()
         tokenized_query = self._tokenize_text(query)
         bm25_scores = self.bm25.get_scores(tokenized_query)
-        q_emb = embedder.encode([query], normalize_embeddings=True)
+        q_emb = encode_query([query], normalize_embeddings=True)
         dense_scores, dense_indices = self.faiss_index.search(q_emb.astype("float32"), len(self.memories))
 
         combined: Dict[int, float] = {}

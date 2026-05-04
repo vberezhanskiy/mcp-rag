@@ -23,7 +23,7 @@ from typing import Optional
 import gitignore_parser
 import json5
 
-from .embedder import encode_batch_size, get_embedder
+from .embedder import encode_batch_size, encode_documents, encode_query
 from ..llm.extractor import LLMExtractor, NoOpExtractor
 
 logger = logging.getLogger(__name__)
@@ -811,10 +811,9 @@ class CodeGraph:
                 self.faiss_index = None
                 self.faiss_names = []
                 return
-            embedder = get_embedder()
             texts = [f"{r[0]} {r[1] or ''}" for r in rows]
             self.faiss_names = [r[0] for r in rows]
-            embeddings = embedder.encode(
+            embeddings = encode_documents(
                 texts, normalize_embeddings=True,
                 show_progress_bar=False, batch_size=encode_batch_size(),
             ).astype("float32")
@@ -1066,9 +1065,8 @@ class CodeGraph:
             })
         if self.faiss_index is not None and self.faiss_names:
             try:
-                embedder = get_embedder()
-                q_vec = embedder.encode([query], normalize_embeddings=True,
-                                        show_progress_bar=False).astype("float32")
+                q_vec = encode_query([query], normalize_embeddings=True,
+                                     show_progress_bar=False).astype("float32")
                 k = min(limit, self.faiss_index.ntotal)
                 scores, indices = self.faiss_index.search(q_vec, k)
                 faiss_top = {self.faiss_names[i] for s, i in zip(scores[0], indices[0])
