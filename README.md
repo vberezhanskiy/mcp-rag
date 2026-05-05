@@ -262,8 +262,7 @@ For CPU-only setups, set `MCP_RAG_DEVICE=cpu` — works, just slower. For Apple 
 |---|---|---|---|---|
 | `sentence-transformers/all-MiniLM-L6-v2` | 23M | ~80 MB | EN only | The lightweight escape hatch — fits anywhere, runs on CPU at meaningful speed, but no RU/multilingual support. Pick this if your project is English-only and you want minimal footprint. |
 | `BAAI/bge-m3` (default) | 568M | ~1.2 GB | 100+ | Encoder-only, safe on 16GB GPUs, 8k context. Good RU/EN balance, no prefix gymnastics. |
-| `Qwen/Qwen3-Embedding-0.6B` | 600M | unstable on 16GB | 100+ | Decoder-only LLM with KV cache; better MTEB Multilingual but can OOM on long inputs unless you cap seq_len aggressively. |
-| `Qwen/Qwen3-Embedding-4B` | 4B | ~8 GB | 100+ | Higher MTEB still, comfortable on 24GB+ cards. |
+| `Qwen/Qwen3-Embedding-0.6B` | 600M | unstable on 16GB | 100+ | Decoder-only LLM with KV cache; better MTEB Multilingual on paper but OOMs in practice on consumer GPUs once a real corpus is fed in. Documented as opt-in, not a recommendation. |
 
 ---
 
