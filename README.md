@@ -1,3 +1,5 @@
+**English** · [Русский](README.ru.md)
+
 # mcp-rag
 
 A self-hosted MCP server that turns any source tree into a **code knowledge graph** plus **hybrid semantic + lexical search** + an **interactive HTML visualization**. Designed for Claude Code, but speaks plain MCP so any MCP-aware client (Cursor, Continue, custom agents) can plug in.
