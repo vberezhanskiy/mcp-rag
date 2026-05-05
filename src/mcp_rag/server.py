@@ -1148,7 +1148,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    logging.basicConfig(level=args.log_level, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     storage = Path(args.storage) if args.storage else None
     config = Config(
@@ -1156,6 +1156,21 @@ def main() -> None:
         storage_root=storage or (Path.home() / ".mcp-rag"),
     )
     embedder.configure(config.models_dir)
+
+    # Mirror logs to a per-project file — Claude Code doesn't persist
+    # the MCP subprocess's stderr, so without this the user has no way
+    # to see what happened during background builds, watcher activity,
+    # etc. The path is printed at INFO level so it's discoverable.
+    log_file = os.getenv("MCP_RAG_LOG_FILE") or str(config.project_dir / "server.log")
+    try:
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
+        fh.setLevel(args.log_level)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
+        logger.info("Log file: %s", log_file)
+    except Exception as e:
+        logger.warning("Could not attach file log handler at %s: %s", log_file, e)
 
     services = Services(config=config, llm_extractor=_resolve_llm_extractor())
     server = build_server(services)
