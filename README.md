@@ -106,16 +106,37 @@ Tree-sitter + regex cover the common case. Set these if you want a fallback for 
 
 ### Example: full Claude Code config
 
+JSON has no comments, but you can sit a `_available_env_options` field
+next to `env` as a self-documenting reference. Claude Code ignores
+unknown fields, so it stays out of the way. (Heads-up: `claude mcp
+add/remove` may rewrite the file and drop unknown keys — keep a copy
+elsewhere if that bites.)
+
 ```json
 {
   "mcpServers": {
     "rag": {
       "type": "stdio",
       "command": "D:\\Projects\\mcp-rag\\.venv\\Scripts\\mcp-rag.exe",
+      "args": [],
       "env": {
-        "MCP_RAG_NO_MEMORY": "1",
-        "MCP_RAG_RERANK": "1",
-        "MCP_RAG_DEVICE": "cuda"
+        "MCP_RAG_EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        "MCP_RAG_RERANKER_MODEL": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "MCP_RAG_NO_MEMORY": "1"
+      },
+      "_available_env_options": {
+        "MCP_RAG_PROJECT":        "Project root (default: cwd)",
+        "MCP_RAG_STORAGE":        "Storage root (default: ~/.mcp-rag)",
+        "MCP_RAG_EMBED_MODEL":    "Sentence-transformers id (default: BAAI/bge-m3). Lightweight: sentence-transformers/all-MiniLM-L6-v2",
+        "MCP_RAG_RERANKER_MODEL": "Cross-encoder for rerank (default: BAAI/bge-reranker-base). Lightweight: cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "MCP_RAG_RERANK":         "0 to disable cross-encoder rerank (default: 1)",
+        "MCP_RAG_DEVICE":         "cuda / mps / cpu (default: auto-detected)",
+        "MCP_RAG_NO_WATCH":       "1 to disable filesystem watcher",
+        "MCP_RAG_NO_MEMORY":      "1 to hide memory_* tools (15 vs 20 tools)",
+        "MCP_RAG_LOG":            "DEBUG / INFO / WARNING / ERROR (default: INFO)",
+        "MCP_RAG_LLM_BASE_URL":   "OpenAI-compat endpoint for LLM fallback extractor",
+        "MCP_RAG_LLM_API_KEY":    "Bearer token for LLM fallback",
+        "MCP_RAG_LLM_MODEL":      "Model id for LLM fallback (default: deepseek-chat)"
       }
     }
   }
