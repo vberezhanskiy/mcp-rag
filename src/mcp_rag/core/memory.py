@@ -20,6 +20,14 @@ from .embedder import _embed_model_id, encode_documents, encode_query
 logger = logging.getLogger(__name__)
 
 
+def _as_list(v) -> List[str]:
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    if isinstance(v, str) and v:
+        return [v]
+    return []
+
+
 class Memory:
     def __init__(
         self,
@@ -82,25 +90,194 @@ class MemorySystem:
         text = text.replace("_", " ").replace("/", " ").replace("\\", " ").replace(".", " ").replace("-", " ")
         return [tok for tok in re.findall(r"[A-Za-zА-Яа-я0-9]+", text.lower()) if len(tok) > 1]
 
+    # ── storage layout ──
+    # Facts persist as `<memory_dir>/memories/<type>__<id>__<slug>.md` plus a
+    # human-readable `MEMORY.md` index in the memory_dir root. JSON snapshot
+    # is kept alongside as a backup / convenience for programmatic readers.
+    # Layout matches Claude Code's per-project memory directory so a fact can
+    # be read or hand-edited in any text editor.
+
+    @property
+    def md_dir(self) -> Path:
+        d = self.memory_dir / "memories"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @property
+    def index_file(self) -> Path:
+        return self.memory_dir / "MEMORY.md"
+
+    _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n(.*)\Z", re.DOTALL)
+
     def _load_memories(self) -> None:
+        # Prefer the .md layout. If empty but the legacy JSON exists, read
+        # JSON once and rewrite as .md on the next save (auto-migration).
+        md_files = sorted((self.memory_dir / "memories").glob("*.md")) \
+            if (self.memory_dir / "memories").exists() else []
+        if md_files:
+            self.memories = []
+            for path in md_files:
+                try:
+                    self.memories.append(self._read_md(path))
+                except Exception as e:
+                    logger.warning("Failed to read %s: %s", path, e)
+            logger.info("Loaded %d memories from %s", len(self.memories), self.md_dir)
+            return
+
         if self.memories_file.exists():
             try:
                 with open(self.memories_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.memories = [Memory.from_dict(m) for m in data]
-                logger.info("Loaded %d memories from %s", len(self.memories), self.memories_file)
+                logger.info("Migrating %d memories from JSON → markdown layout", len(self.memories))
+                self._save_memories()
+                return
             except Exception as e:
-                logger.warning("Failed to load memories: %s", e)
-                self.memories = []
-        else:
-            self.memories = []
+                logger.warning("Failed to load memories.json: %s", e)
+        self.memories = []
 
     def _save_memories(self) -> None:
+        # Drop .md files for memory ids that no longer exist (delete/merge).
+        live_ids = {m.id for m in self.memories}
+        for f in self.md_dir.glob("*.md"):
+            if self._extract_id_from_filename(f.name) not in live_ids:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+        for mem in self.memories:
+            try:
+                self._md_path_for(mem).write_text(self._render_md(mem), encoding="utf-8")
+            except Exception as e:
+                logger.warning("Failed to write memory %s: %s", mem.id, e)
+
+        try:
+            self.index_file.write_text(self._render_index(), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Failed to write MEMORY.md: %s", e)
+
         try:
             with open(self.memories_file, "w", encoding="utf-8") as f:
                 json.dump([m.to_dict() for m in self.memories], f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error("Failed to save memories: %s", e)
+            logger.error("Failed to save memories.json snapshot: %s", e)
+
+    # ── markdown helpers ──
+
+    @classmethod
+    def _read_md(cls, path: Path) -> Memory:
+        text = path.read_text(encoding="utf-8")
+        m = cls._FRONTMATTER_RE.match(text)
+        if not m:
+            return Memory(content=text.strip(), memory_type="general", tags=[])
+        front = cls._parse_frontmatter(m.group(1))
+        body = m.group(2).strip()
+        content = body or front.get("content") or ""
+        mem = Memory(
+            content=content,
+            memory_type=front.get("type") or front.get("memory_type") or "general",
+            tags=_as_list(front.get("tags")),
+            confidence=float(front.get("confidence", 1.0) or 1.0),
+            metadata=front.get("metadata") or {},
+        )
+        if "id" in front:
+            mem.id = str(front["id"])
+        if "timestamp" in front:
+            mem.timestamp = str(front["timestamp"])
+        return mem
+
+    @staticmethod
+    def _parse_frontmatter(block: str) -> dict:
+        # Lightweight YAML-ish parser. Enough for `key: value` and bracketed
+        # list literals. We avoid pulling a full YAML dep just for this.
+        out: dict = {}
+        for line in block.splitlines():
+            line = line.rstrip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition(":")
+            if not _:
+                continue
+            key = key.strip()
+            value = value.strip()
+            if not value:
+                out[key] = ""
+                continue
+            if value.startswith("[") and value.endswith("]"):
+                inner = value[1:-1].strip()
+                if not inner:
+                    out[key] = []
+                    continue
+                items = [p.strip().strip("'\"") for p in inner.split(",")]
+                out[key] = [p for p in items if p]
+                continue
+            out[key] = value.strip("'\"")
+        return out
+
+    def _md_path_for(self, mem: Memory) -> Path:
+        return self.md_dir / f"{mem.memory_type}__{mem.id}__{self._slug(mem.content)}.md"
+
+    @staticmethod
+    def _extract_id_from_filename(name: str) -> str:
+        parts = name.removesuffix(".md").split("__")
+        return parts[1] if len(parts) >= 3 else ""
+
+    @staticmethod
+    def _slug(text: str, limit: int = 40) -> str:
+        s = re.sub(r"[^A-Za-z0-9_]+", "-", (text or "").strip().lower()).strip("-")
+        return (s[:limit] or "memory").rstrip("-")
+
+    @staticmethod
+    def _render_md(mem: Memory) -> str:
+        tags = ", ".join(f"'{t}'" for t in mem.tags)
+        meta_block = ""
+        if mem.metadata:
+            try:
+                meta_block = "\nmetadata: " + json.dumps(mem.metadata, ensure_ascii=False)
+            except Exception:
+                meta_block = ""
+        return (
+            "---\n"
+            f"id: {mem.id}\n"
+            f"type: {mem.memory_type}\n"
+            f"tags: [{tags}]\n"
+            f"confidence: {mem.confidence}\n"
+            f"timestamp: {mem.timestamp}{meta_block}\n"
+            "---\n"
+            f"{mem.content}\n"
+        )
+
+    def _render_index(self) -> str:
+        if not self.memories:
+            return "# Memory\n\n_No facts persisted yet._\n"
+        groups: Dict[str, List[Memory]] = {}
+        for mem in self.memories:
+            groups.setdefault(mem.memory_type, []).append(mem)
+        lines = [
+            "# Memory",
+            "",
+            f"_{len(self.memories)} fact(s) across {len(groups)} type(s). "
+            "Each entry below links to the corresponding `.md` file._",
+            "",
+        ]
+        for memory_type in sorted(groups):
+            entries = sorted(
+                groups[memory_type],
+                key=lambda m: (m.timestamp or "", m.id),
+                reverse=True,
+            )
+            lines.append(f"## {memory_type} ({len(entries)})")
+            for mem in entries:
+                rel = self._md_path_for(mem).relative_to(self.memory_dir).as_posix()
+                lines.append(f"- [{mem.id}]({rel}) — {self._one_line_hook(mem.content)}")
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _one_line_hook(content: str, limit: int = 110) -> str:
+        flat = " ".join((content or "").split())
+        return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
     def _get_embedding(self, text: str) -> np.ndarray:
         # Cache key includes the model id so a model swap doesn't return
