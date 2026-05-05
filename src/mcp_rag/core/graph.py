@@ -1451,6 +1451,28 @@ class CodeGraph:
                 })
         return {"file": rel_path, "entities": defined, "deps": deps, "used_by": used_by}
 
+    def visualize(self, output_path: Path, title: Optional[str] = None, module_depth: int = 2) -> dict:
+        """Build the per-project HTML graph viewer. Returns metadata dict
+        with ``output_path`` and counts. Caller is responsible for opening
+        the file in a browser.
+        """
+        from .visualizer import build_visualization_data, render_html
+        data = build_visualization_data(
+            db_path=self.db_path,
+            project_root=self.project_root,
+            module_depth=module_depth,
+        )
+        html = render_html(data, title or f"Code graph — {self.project_root.name}")
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(html, encoding="utf-8")
+        return {
+            "output_path": str(output_path),
+            "modules": data["stats"]["modules"],
+            "files": data["stats"]["files"],
+            "relations": data["stats"]["relations"],
+        }
+
     def clear(self) -> None:
         with sqlite3.connect(self.db_path) as con:
             con.executescript("DELETE FROM entities; DELETE FROM relations; DELETE FROM file_meta;")

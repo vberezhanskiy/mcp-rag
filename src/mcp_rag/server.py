@@ -319,6 +319,38 @@ def _build_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="graph_visualize",
+            description=(
+                "Render the project's dependency graph as a self-contained "
+                "HTML file with three drill-down levels:\n"
+                "  • Modules — top-level path-prefix nodes, cross-module "
+                "    edges weighted by relation count\n"
+                "  • Files — double-click a module to see its files plus "
+                "    file→file edges (dashed = link to outside the module)\n"
+                "  • Entities — double-click a file to see its declared "
+                "    classes/functions/components and their relations\n\n"
+                "Self-contained: vis-network from CDN, all data inlined as "
+                "JSON. Returns the path to the generated HTML — open it "
+                "in a browser."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "output_path": {
+                        "type": "string",
+                        "description": "Where to write the HTML (default: <project>/.mcp-rag-graph.html)",
+                    },
+                    "module_depth": {
+                        "type": "integer",
+                        "default": 2,
+                        "minimum": 1,
+                        "maximum": 4,
+                        "description": "How many leading path segments form a module id (e.g. 2 → 'storybook/src/components')",
+                    },
+                },
+            },
+        ),
+        Tool(
             name="graph_clear",
             description=(
                 "Wipe the knowledge graph for this project. Destructive — "
@@ -451,6 +483,7 @@ _GRAPH_TOOLS_NEEDING_DATA = {
     "graph_explain",
     "graph_dead_code",
     "graph_find_similar",
+    "graph_visualize",
 }
 
 
@@ -734,6 +767,18 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             "incoming relations and may be false positives."
         )
         return "\n".join(lines)
+
+    if name == "graph_visualize":
+        out = args.get("output_path") or str(services.config.project_root / ".mcp-rag-graph.html")
+        depth = max(1, min(int(args.get("module_depth", 2)), 4))
+        info = g.visualize(output_path=Path(out), module_depth=depth)
+        return (
+            f"Graph visualization written to: {info['output_path']}\n"
+            f"Modules: {info['modules']}, files: {info['files']}, "
+            f"relations: {info['relations']}\n"
+            f"Open the file in a browser. Double-click any node to drill in, "
+            f"breadcrumb buttons up top to navigate back."
+        )
 
     if name == "graph_clear":
         g.clear()
