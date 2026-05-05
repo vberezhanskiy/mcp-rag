@@ -68,8 +68,18 @@ class Services:
         return self._memory
 
 
+def _memory_disabled() -> bool:
+    """``MCP_RAG_NO_MEMORY=1`` hides the memory_* tools.
+
+    Useful when the host already has its own persistent memory (e.g.
+    Claude Code's ``~/.claude/memory/``) and the duplicate surface in
+    the tool list is just noise.
+    """
+    return (os.getenv("MCP_RAG_NO_MEMORY") or "").strip() in {"1", "true", "yes", "on"}
+
+
 def _build_tools() -> list[Tool]:
-    return [
+    tools = [
         Tool(
             name="graph_build",
             description=(
@@ -464,6 +474,9 @@ def _build_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
+    if _memory_disabled():
+        tools = [t for t in tools if not t.name.startswith("memory_")]
+    return tools
 
 
 def _norm_path(p: str) -> str:
@@ -794,6 +807,12 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             top_k_initial=max(top_k * 4, 30),
             top_k_final=top_k,
             max_chunk_preview=max_chunk,
+        )
+
+    if name.startswith("memory_") and _memory_disabled():
+        return (
+            "memory_* tools are disabled on this server "
+            "(MCP_RAG_NO_MEMORY=1). Unset the env var to re-enable."
         )
 
     if name == "memory_add":
