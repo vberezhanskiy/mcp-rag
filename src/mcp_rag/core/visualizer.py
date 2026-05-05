@@ -117,8 +117,15 @@ def build_visualization_data(
     for f, name, t, ls in entities:
         by_file[f].append((name, t, ls))
     for f, ents in by_file.items():
+        # Drop the file's "self" entity (name == file path, type=module)
+        # — it's a technical row that represents the file itself, not a
+        # user-visible declaration. Drop sub-1-char names too.
         primary = sorted(
-            (e for e in ents if e[1] in primary_types and len(e[0]) > 1),
+            (e for e in ents
+             if e[1] in primary_types
+             and len(e[0]) > 1
+             and e[0] != f
+             and not (e[1] == "module" and "/" in e[0])),
             key=lambda e: (e[2] or 0, e[0]),
         )[:50]
         file_entities[f] = {
@@ -398,6 +405,12 @@ function onDoubleClick(params) {
   const cur = stack[stack.length - 1];
   if (cur.level === 'modules') renderModule(id);
   else if (cur.level === 'module') renderFileSide(id);
+  else if (cur.level === 'file') {
+    // Side panel already open for a previous file — pop it so the new
+    // pick replaces the old one instead of stacking up.
+    stack.pop();
+    renderFileSide(id);
+  }
 }
 
 function escapeHtml(s) {
