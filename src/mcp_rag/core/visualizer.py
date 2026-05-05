@@ -219,11 +219,29 @@ const meta = document.getElementById('meta');
 
 function setData(nodes, edges) {
   if (network) network.destroy();
+  // Bigger graphs need a stronger settle. Once the layout is stable we
+  // turn physics off so dragging / clicking nodes doesn't kick the
+  // simulation back into motion.
+  const iters = Math.min(800, Math.max(200, nodes.length * 4));
   network = new vis.Network(container, {nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges)}, {
-    physics: { stabilization: { iterations: 200 }, barnesHut: { gravitationalConstant: -8000, springLength: 120 } },
+    physics: {
+      enabled: true,
+      stabilization: { enabled: true, iterations: iters, fit: true, updateInterval: 25 },
+      barnesHut: {
+        gravitationalConstant: -10000,
+        centralGravity: 0.4,
+        springLength: 140,
+        springConstant: 0.04,
+        damping: 0.5,
+      },
+    },
+    layout: { improvedLayout: nodes.length < 200 },
     nodes: { borderWidth: 1, font: { color: '#d4d4d4', size: 14 }, shape: 'dot' },
     edges: { color: { color: '#5a5a5a', highlight: '#aaaaaa' }, smooth: { type: 'continuous' }, arrows: { to: { enabled: true, scaleFactor: 0.5 } } },
-    interaction: { hover: true, tooltipDelay: 100 },
+    interaction: { hover: true, tooltipDelay: 100, dragNodes: true },
+  });
+  network.once('stabilizationIterationsDone', () => {
+    network.setOptions({ physics: { enabled: false } });
   });
   network.on('click', onClick);
   network.on('doubleClick', onDoubleClick);
