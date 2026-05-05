@@ -516,6 +516,12 @@ class CodeGraph:
         }
         suffix = Path(rel_path).suffix.lower()
         is_jsx = suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"}
+        # Calls whose first capitalized argument is the *real* dependency
+        # we want to track. Angular DI hides class usages behind these
+        # factories, so a plain "calls inject" relation is useless on its
+        # own — we also emit "uses ServiceClass" to make
+        # graph_find_usages('ServiceClass') see the dep.
+        di_factories = {"inject", "TestBed.inject"}
 
         def scope_for_line(line_number: int) -> str:
             best_name = rel_path
@@ -551,6 +557,25 @@ class CodeGraph:
                 if rel_key not in seen_relations:
                     seen_relations.add(rel_key)
                     relations.append({"from": owner, "relation": "calls", "to": symbol})
+
+                # DI factory: read the first PascalCase identifier from the
+                # arg list and emit a `uses` edge to it.
+                if symbol in di_factories or raw_name in di_factories:
+                    rest = line[match.end():]
+                    arg_match = re.match(r"\s*([A-Z][A-Za-z0-9_]*)", rest)
+                    if arg_match:
+                        service = arg_match.group(1)
+                        if service not in seen_entities:
+                            seen_entities.add(service)
+                            entities.append({
+                                "name": service,
+                                "type": self._infer_symbol_entity_type(service),
+                                "description": f"Injected via {symbol}()",
+                            })
+                        di_key = (owner, "uses", service)
+                        if di_key not in seen_relations:
+                            seen_relations.add(di_key)
+                            relations.append({"from": owner, "relation": "uses", "to": service})
 
             # JSX component usage: `<Alert />`, `<Layout.Sider>`, `<MyMenu prop=…>`.
             # Function calls (`Name(`) above already capture HOC/render-fn forms;
@@ -1419,6 +1444,9 @@ class CodeGraph:
                 SELECT e.file, e.name, e.type, e.description, e.line_start, e.line_end, e.snippet
                 FROM entities e
                 WHERE e.type IN ({placeholders})
+                  AND (e.description IS NULL
+                       OR (e.description NOT LIKE 'Template %'
+                           AND e.description NOT LIKE 'JSX component reference%'))
                   AND NOT EXISTS (
                       SELECT 1 FROM relations r
                       WHERE r.to_name = e.name
