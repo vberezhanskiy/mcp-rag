@@ -13,3 +13,8 @@ build/
 .vscode/
 *.log
 .DS_Store
+# Never commit local secrets — mcp-rag itself doesn't ship one,
+# but contributors might create .env for testing the LLM extractor.
+.env
+.env.*
+!.env.example
