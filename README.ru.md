@@ -263,6 +263,24 @@ FS-watcher (watchdog) держит граф свежим между явными
 | `BAAI/bge-m3` (default) | 568M | ~1.2 GB | 100+ | Encoder-only, безопасно на 16GB GPU, контекст 8k. Хороший RU/EN баланс, без префиксного гимнастика. |
 | `Qwen/Qwen3-Embedding-0.6B` | 600M | нестабильно на 16GB | 100+ | Decoder-only LLM с KV-cache; на бумаге MTEB Multilingual выше, но OOM-ит на consumer GPU когда скармливаешь реальный корпус. Документирован как opt-in, не как рекомендация. |
 
+### Preset: лёгкий стек (EN-only, CPU-friendly)
+
+Пара: MiniLM bi-encoder для retrieval + MS MARCO cross-encoder для rerank.
+Обе модели ~80 MB, обе с разумной скоростью на CPU, обе под английский.
+Drop-in конфиг:
+
+```json
+"env": {
+  "MCP_RAG_EMBED_MODEL":    "sentence-transformers/all-MiniLM-L6-v2",
+  "MCP_RAG_RERANKER_MODEL": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+}
+```
+
+Бери это для английских репо когда нет GPU или нужен минимальный
+footprint. Multilingual теряется, но качество поиска по английскому
+коду остаётся приличным — cross-encoder rerank вытаскивает top-K из
+шумного MiniLM-выхода.
+
 ---
 
 ## Storage layout

@@ -266,6 +266,24 @@ For CPU-only setups, set `MCP_RAG_DEVICE=cpu` — works, just slower. For Apple 
 | `BAAI/bge-m3` (default) | 568M | ~1.2 GB | 100+ | Encoder-only, safe on 16GB GPUs, 8k context. Good RU/EN balance, no prefix gymnastics. |
 | `Qwen/Qwen3-Embedding-0.6B` | 600M | unstable on 16GB | 100+ | Decoder-only LLM with KV cache; better MTEB Multilingual on paper but OOMs in practice on consumer GPUs once a real corpus is fed in. Documented as opt-in, not a recommendation. |
 
+### Preset: lightweight (EN-only, CPU-friendly)
+
+Pair MiniLM bi-encoder for retrieval with the MS MARCO cross-encoder
+for rerank — both ~80 MB, both run with meaningful throughput on CPU,
+both English-focused. Drop-in config:
+
+```json
+"env": {
+  "MCP_RAG_EMBED_MODEL":    "sentence-transformers/all-MiniLM-L6-v2",
+  "MCP_RAG_RERANKER_MODEL": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+}
+```
+
+Pick this for English-only repos when you don't have a GPU or want
+the smallest possible footprint. Multilingual support is gone, but
+search quality on English code is still strong because the
+cross-encoder rerank lifts the top-K out of MiniLM's noisier output.
+
 ---
 
 ## Storage layout
