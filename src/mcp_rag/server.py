@@ -41,6 +41,9 @@ class Services:
         self._graph: Optional[CodeGraph] = None
         self._retriever: Optional[MultiLangCodeRetriever] = None
         self._memory: Optional[MemorySystem] = None
+        # Background graph_build task — kept alive on the Services object so
+        # asyncio doesn't GC it while it runs.
+        self._build_task: Optional[asyncio.Task] = None
 
     @property
     def graph(self) -> CodeGraph:
@@ -98,6 +101,11 @@ def _build_tools() -> list[Tool]:
                     "max_files": {
                         "type": "integer",
                         "description": "Optional cap on how many files to index in this call. Omit to index all stale files.",
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, run the build as a background asyncio task and return immediately. Use on big projects where the synchronous call would hit Claude Code's ~30s tool-call timeout. Poll graph_stats / graph_pending_files for progress; graph_stats shows '(build in progress)' while it's running.",
                     },
                 },
             },
@@ -535,7 +543,30 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
     g = services.graph
     if name == "graph_build":
         cap = args.get("max_files")
-        result = await g.build(max_files=int(cap) if cap is not None else None)
+        cap = int(cap) if cap is not None else None
+        if bool(args.get("background", False)):
+            existing = services._build_task
+            if existing is not None and not existing.done():
+                return (
+                    "Background build already in progress. "
+                    "Check graph_stats — it will show '(build in progress)' "
+                    "until done."
+                )
+            async def _bg_build():
+                try:
+                    result = await g.build(max_files=cap)
+                    logger.info("Background graph_build done: %s", result)
+                except Exception:
+                    logger.exception("Background graph_build failed")
+            services._build_task = asyncio.create_task(_bg_build())
+            status = g.get_build_status()
+            return (
+                f"Background build started — {status['stale_files']} stale, "
+                f"{status['deleted_files']} deleted out of {status['total_files']} project files. "
+                f"Poll graph_stats / graph_pending_files; graph_stats shows '(build in progress)' "
+                f"while it's running."
+            )
+        result = await g.build(max_files=cap)
         return json.dumps(result, indent=2)
 
     if name == "graph_index_file":
