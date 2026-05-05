@@ -1451,7 +1451,7 @@ class CodeGraph:
                 })
         return {"file": rel_path, "entities": defined, "deps": deps, "used_by": used_by}
 
-    def visualize(self, output_path: Path, title: Optional[str] = None, module_depth: int = 2) -> dict:
+    def visualize(self, output_path: Path, title: Optional[str] = None, module_depth: int = 3) -> dict:
         """Build the per-project HTML graph viewer. Returns metadata dict
         with ``output_path`` and counts. Caller is responsible for opening
         the file in a browser.

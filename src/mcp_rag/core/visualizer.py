@@ -35,7 +35,7 @@ def _module_id_for_file(rel_path: str, depth: int = 2) -> str:
 def build_visualization_data(
     db_path: Path,
     project_root: Path,
-    module_depth: int = 2,
+    module_depth: int = 3,
 ) -> dict:
     """Compute one shared dataset; the JS view filters on demand.
 
@@ -266,17 +266,43 @@ function renderModules() {
   renderBreadcrumbs();
 }
 
+const MAX_FILES_PER_MODULE = 150;
+
 function renderModule(modId) {
   stack.push({level: 'module', id: modId});
   side.style.display = 'none';
   const mod = DATA.modules.find(m => m.id === modId);
   if (!mod) { renderModules(); return; }
-  const inside = new Set(mod.files);
+
+  // 1. Connectivity score per file inside the module — sum of edge
+  //    weights touching it. Files with 0 connectivity are isolated and
+  //    bring no visual signal, so we drop them.
+  // 2. Cap the visible file count at MAX_FILES_PER_MODULE — vis-network
+  //    starts to thrash on bigger graphs.
+  const insideAll = new Set(mod.files);
+  const conn = {};
+  for (const e of DATA.file_edges) {
+    if (insideAll.has(e.f)) conn[e.f] = (conn[e.f] || 0) + e.w;
+    if (insideAll.has(e.t)) conn[e.t] = (conn[e.t] || 0) + e.w;
+  }
+  let visibleFiles = mod.files.filter(f => (conn[f] || 0) > 0);
+  const isolatedCount = mod.files.length - visibleFiles.length;
+  let cappedCount = 0;
+  if (visibleFiles.length > MAX_FILES_PER_MODULE) {
+    visibleFiles.sort((a, b) => (conn[b] || 0) - (conn[a] || 0));
+    cappedCount = visibleFiles.length - MAX_FILES_PER_MODULE;
+    visibleFiles = visibleFiles.slice(0, MAX_FILES_PER_MODULE);
+  }
+  const inside = new Set(visibleFiles);
+
   const externalIds = new Set();
   const edges = [];
   for (const e of DATA.file_edges) {
     const fromIn = inside.has(e.f), toIn = inside.has(e.t);
     if (!fromIn && !toIn) continue;
+    // Skip edges to/from a file we hid (isolated or capped).
+    if (!fromIn && !insideAll.has(e.f) === false) continue;
+    if (!toIn && !insideAll.has(e.t) === false) continue;
     if (!fromIn) externalIds.add(e.f);
     if (!toIn) externalIds.add(e.t);
     edges.push({
@@ -285,10 +311,10 @@ function renderModule(modId) {
       dashes: !(fromIn && toIn),
     });
   }
-  const nodes = mod.files.map(f => ({
+  const nodes = visibleFiles.map(f => ({
     id: f,
     label: f.split('/').pop(),
-    title: f + '\n' + (DATA.file_entity_count[f] || 0) + ' entities',
+    title: f + '\n' + (DATA.file_entity_count[f] || 0) + ' entities · ' + (conn[f] || 0) + ' connections',
     color: palette.file,
     size: Math.min(30, 8 + (DATA.file_entity_count[f] || 0) / 3),
   }));
@@ -299,7 +325,14 @@ function renderModule(modId) {
     });
   });
   setData(nodes, edges);
-  meta.textContent = nodes.length + ' files (' + inside.size + ' inside, ' + externalIds.size + ' linked) · ' + edges.length + ' edges';
+
+  let metaText = visibleFiles.length + ' files shown';
+  const hiddenBits = [];
+  if (isolatedCount > 0) hiddenBits.push(isolatedCount + ' isolated');
+  if (cappedCount > 0) hiddenBits.push(cappedCount + ' under cap');
+  if (hiddenBits.length) metaText += ' (' + hiddenBits.join(', ') + ' hidden)';
+  metaText += ' · ' + externalIds.size + ' external · ' + edges.length + ' edges';
+  meta.textContent = metaText;
   renderBreadcrumbs();
 }
 
