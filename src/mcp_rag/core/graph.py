@@ -1139,7 +1139,23 @@ class CodeGraph:
 
         with sqlite3.connect(self.db_path) as con:
             if not tokens:
-                rows = []
+                # Empty query — list-all mode. Useful when the caller only
+                # wants a type filter ("show every class", browse-by-type
+                # in a UI). Returns rows ordered by file/line.
+                params: list = []
+                where_type = ""
+                if entity_type:
+                    where_type = " WHERE type = ?"
+                    params.append(entity_type)
+                params.append(limit * 3)
+                sql = (
+                    "SELECT file, name, type, description, line_start, line_end, snippet "
+                    f"FROM entities{where_type} "
+                    "ORDER BY file, "
+                    "  CASE WHEN line_start IS NULL THEN 1 ELSE 0 END, line_start, name "
+                    "LIMIT ?"
+                )
+                rows = con.execute(sql, params).fetchall()
             else:
                 like_clauses = " OR ".join(["lower(name) LIKE lower(?)"] * len(tokens))
                 like_params = [f"%{t}%" for t in tokens]
