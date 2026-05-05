@@ -122,6 +122,11 @@ Tree-sitter + regex cover the common case. Set these if you want a fallback for 
 
 ### Example: with the LLM fallback
 
+Claude Code passes `env` values to the subprocess literally — there's no
+shell-style `${VAR}` expansion — so the API key has to be a real string,
+not a reference. Either drop it inline (and keep the file out of git)
+or wrap the launcher in a shell script that loads from `.env`:
+
 ```json
 {
   "mcpServers": {
@@ -130,9 +135,31 @@ Tree-sitter + regex cover the common case. Set these if you want a fallback for 
       "command": "/usr/local/bin/mcp-rag",
       "env": {
         "MCP_RAG_LLM_BASE_URL": "https://api.deepseek.com/v1",
-        "MCP_RAG_LLM_API_KEY": "${DEEPSEEK_API_KEY}",
+        "MCP_RAG_LLM_API_KEY": "sk-replace-with-your-key",
         "MCP_RAG_LLM_MODEL": "deepseek-chat"
       }
+    }
+  }
+}
+```
+
+Wrapper-script alternative on Windows (`start-mcp-rag.bat`):
+
+```bat
+@echo off
+set MCP_RAG_LLM_BASE_URL=https://api.deepseek.com/v1
+set MCP_RAG_LLM_API_KEY=sk-...
+set MCP_RAG_LLM_MODEL=deepseek-chat
+"D:\Projects\mcp-rag\.venv\Scripts\mcp-rag.exe" %*
+```
+
+```json
+{
+  "mcpServers": {
+    "rag": {
+      "type": "stdio",
+      "command": "cmd.exe",
+      "args": ["/c", "D:\\path\\start-mcp-rag.bat"]
     }
   }
 }
