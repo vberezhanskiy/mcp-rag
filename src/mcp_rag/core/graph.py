@@ -149,6 +149,10 @@ class CodeGraph:
         self.faiss_index = None
         self.faiss_names: list[str] = []
         self._is_building = False
+        # Set when reindex_file runs without an immediate FAISS rebuild
+        # (e.g. from the file-system watcher). Similarity tools check this
+        # and trigger a rebuild before serving stale data.
+        self._faiss_dirty = False
         self._gitignore_parser = None
         gitignore_path = self.project_root / ".gitignore"
         if gitignore_path.exists():
@@ -719,11 +723,14 @@ class CodeGraph:
         except Exception as e:
             logger.warning("Failed to index %s: %s", filepath, e)
 
-    async def reindex_file(self, filepath: Path) -> None:
+    async def reindex_file(self, filepath: Path, rebuild_faiss: bool = True) -> None:
         rel = filepath.relative_to(self.project_root).as_posix()
         self._delete_file_data(rel)
         await self.index_file(filepath)
-        self._rebuild_faiss()
+        if rebuild_faiss:
+            self._rebuild_faiss()
+        else:
+            self._faiss_dirty = True
 
     def get_build_status(self) -> dict:
         files = self._get_files()
@@ -860,6 +867,7 @@ class CodeGraph:
         return "\n".join(parts)
 
     def _rebuild_faiss(self) -> None:
+        self._faiss_dirty = False
         try:
             import faiss
             with sqlite3.connect(self.db_path) as con:
@@ -1282,7 +1290,7 @@ class CodeGraph:
         rows whose snippet is just `import { A, B, C }` don't drag in
         their co-imported siblings.
         """
-        if self.faiss_index is None or not self.faiss_names:
+        if self.faiss_index is None or not self.faiss_names or self._faiss_dirty:
             self._rebuild_faiss()
         if self.faiss_index is None or not self.faiss_names:
             return {

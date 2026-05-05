@@ -1059,6 +1059,12 @@ def _parse_args() -> argparse.Namespace:
         default=os.getenv("MCP_RAG_LOG", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--no-watch",
+        action="store_true",
+        default=(os.getenv("MCP_RAG_NO_WATCH") or "").strip() in {"1", "true", "yes"},
+        help="Disable the filesystem watcher (auto-reindex on edits).",
+    )
     return parser.parse_args()
 
 
@@ -1077,10 +1083,24 @@ def main() -> None:
     server = build_server(services)
 
     async def _run() -> None:
-        async with stdio_server() as (read, write):
-            await server.run(read, write, server.create_initialization_options())
+        watcher: Optional["GraphWatcher"] = None
+        if not args.no_watch:
+            from .core.watcher import GraphWatcher
+            try:
+                watcher = GraphWatcher(services.graph)
+                watcher.start()
+            except Exception as e:
+                logger.warning("Failed to start file watcher: %s — proceeding without auto-reindex", e)
+                watcher = None
+        try:
+            async with stdio_server() as (read, write):
+                await server.run(read, write, server.create_initialization_options())
+        finally:
+            if watcher is not None:
+                watcher.stop()
 
-    logger.info("mcp-rag serving project=%s storage=%s", config.project_root, config.storage_root)
+    logger.info("mcp-rag serving project=%s storage=%s watch=%s",
+                config.project_root, config.storage_root, not args.no_watch)
     asyncio.run(_run())
 
 
