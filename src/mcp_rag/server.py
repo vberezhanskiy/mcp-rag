@@ -508,16 +508,44 @@ _GRAPH_TOOLS_NEEDING_DATA = {
 }
 
 
-async def _ensure_graph_built(services: Services) -> Optional[str]:
-    """If the graph is empty, build it now and return a status banner.
+_AUTO_BUILD_SYNC_THRESHOLD = 300
 
-    Returns None when the graph already has data or the build failed —
-    callers prepend the banner to their response.
+
+async def _ensure_graph_built(services: Services) -> Optional[str]:
+    """If the graph is empty, build it (sync for small projects, async for
+    big ones) and return a status banner. None when data is already there.
     """
     g = services.graph
     if g.get_stats()["entities"] > 0:
         return None
-    logger.info("Graph empty — auto-build before serving request")
+
+    # If a background build is already running (kicked off at server start
+    # or by a prior call), don't start another — just tell the caller to
+    # wait. Partial state may still serve some queries.
+    bt = services._build_task
+    if bt is not None and not bt.done():
+        status = g.get_build_status()
+        return (
+            f"ℹ Background build still running — "
+            f"{status['indexed_project_files']} of {status['total_files']} indexed so far. "
+            f"Retry in a moment for fresh data.\n\n"
+        )
+
+    status = g.get_build_status()
+    total = status["total_files"]
+    # Large projects don't fit Claude Code's ~30s tool-call window — do
+    # this in the background and let the caller poll graph_stats.
+    if total > _AUTO_BUILD_SYNC_THRESHOLD:
+        logger.info("Auto-build (background) for %d files", total)
+        services._build_task = asyncio.create_task(g.build())
+        return (
+            f"ℹ Graph empty for {total} files — kicked off a background build. "
+            f"Retry your request in ~1 min, or watch progress with graph_stats / "
+            f"graph_pending_files.\n\n"
+        )
+
+    # Small project — synchronous is fine, user gets results in one round-trip.
+    logger.info("Auto-build (sync) for %d files", total)
     try:
         result = await g.build()
     except Exception as e:
@@ -1142,12 +1170,28 @@ def main() -> None:
             except Exception as e:
                 logger.warning("Failed to start file watcher: %s — proceeding without auto-reindex", e)
                 watcher = None
+
+        # Eager background build at boot: if the graph is empty for a
+        # non-trivial project, start indexing right away so the first
+        # tool call doesn't pay the full cost. Skipped for tiny projects
+        # (sync auto-build at first call is faster than the round trip).
+        try:
+            if services.graph.get_stats()["entities"] == 0:
+                status = services.graph.get_build_status()
+                if status["total_files"] > 50:
+                    logger.info("Starting eager background build for %d files", status["total_files"])
+                    services._build_task = asyncio.create_task(services.graph.build())
+        except Exception as e:
+            logger.warning("eager build start failed: %s", e)
+
         try:
             async with stdio_server() as (read, write):
                 await server.run(read, write, server.create_initialization_options())
         finally:
             if watcher is not None:
                 watcher.stop()
+            if services._build_task is not None and not services._build_task.done():
+                services._build_task.cancel()
 
     logger.info("mcp-rag serving project=%s storage=%s watch=%s",
                 config.project_root, config.storage_root, not args.no_watch)
