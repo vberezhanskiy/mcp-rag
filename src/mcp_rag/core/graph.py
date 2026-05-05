@@ -1484,6 +1484,19 @@ class CodeGraph:
     def clear(self) -> None:
         with sqlite3.connect(self.db_path) as con:
             con.executescript("DELETE FROM entities; DELETE FROM relations; DELETE FROM file_meta;")
+        # SQLite keeps freed pages for reuse — DELETE alone won't shrink
+        # the .db file. VACUUM rewrites the database to compact form, but
+        # it can't run inside a transaction, so we open a separate
+        # autocommit connection.
+        try:
+            con = sqlite3.connect(self.db_path, isolation_level=None)
+            try:
+                con.execute("VACUUM")
+            finally:
+                con.close()
+        except Exception as e:
+            logger.warning("VACUUM after clear failed: %s", e)
         self.faiss_index = None
         self.faiss_names = []
+        self._faiss_dirty = False
         logger.info("Code graph cleared")
