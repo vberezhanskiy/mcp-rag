@@ -338,7 +338,7 @@ def _build_tools() -> list[Tool]:
                 "properties": {
                     "output_path": {
                         "type": "string",
-                        "description": "Where to write the HTML (default: <project>/.mcp-rag-graph.html)",
+                        "description": "Where to write the HTML (default: ~/.mcp-rag/projects/<slug>/graph.html so the project working tree stays clean).",
                     },
                     "module_depth": {
                         "type": "integer",
@@ -769,7 +769,9 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return "\n".join(lines)
 
     if name == "graph_visualize":
-        out = args.get("output_path") or str(services.config.project_root / ".mcp-rag-graph.html")
+        # Default to the per-project storage dir (alongside graph.db,
+        # retriever cache, etc.) so the project working tree stays clean.
+        out = args.get("output_path") or str(services.config.project_dir / "graph.html")
         depth = max(1, min(int(args.get("module_depth", 2)), 4))
         info = g.visualize(output_path=Path(out), module_depth=depth)
         return (
