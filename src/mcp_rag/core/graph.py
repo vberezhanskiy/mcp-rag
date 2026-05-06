@@ -133,6 +133,156 @@ _IGNORE_DIRS = {
 _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
+# ── Trait detection: per-language regex patterns ────────────────────────────
+# Source-of-truth used by _detect_traits. Compiled once at module load.
+# Add new languages here, not in the detector body — keeps the function
+# pure-data-driven and the regex set easy to audit.
+
+_LANG_FROM_EXT: dict[str, str] = {
+    ".py": "python",
+    ".js": "js", ".jsx": "js", ".mjs": "js", ".cjs": "js",
+    ".ts": "ts", ".tsx": "ts",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".cs": "cs",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".rb": "ruby",
+    ".php": "php",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp", ".hh": "cpp",
+    # `.h` is ambiguous (C or C++). Map to cpp — the cpp pattern set is a
+    # superset of the c set, so pure-C headers still get their static/extern
+    # detection while C++ headers also pick up pure-virtual abstract markers.
+    ".c": "c", ".h": "cpp",
+    ".lua": "lua",
+    ".dart": "dart",
+}
+
+
+def _rx(pattern: str, flags: int = 0) -> re.Pattern:
+    return re.compile(pattern, flags)
+
+
+_TRAIT_PATTERNS_PER_LANG: dict[str, dict[str, list[re.Pattern]]] = {
+    "python": {
+        "async":      [_rx(r"\basync\s+def\b")],
+        "generator":  [_rx(r"\byield\b")],
+        "abstract":   [_rx(r"@abstractmethod\b|@abstractclassmethod\b|@abstractproperty\b"),
+                       _rx(r"\bclass\s+\w+\s*\(\s*[A-Za-z_.]*ABC[A-Za-z_.]*\s*[,)]")],
+        "static":     [_rx(r"@staticmethod\b|@classmethod\b")],
+    },
+    "js": {
+        "async":          [_rx(r"\basync\s+(?:function|\([^)]*\)|[A-Za-z_$][\w$]*\s*=)")],
+        "generator":      [_rx(r"\bfunction\s*\*"), _rx(r"^\s*\*\s*\w+\s*\("), _rx(r"\byield\b")],
+        "exported":       [_rx(r"\bexport(?:\s+default)?\b")],
+        "default-export": [_rx(r"\bexport\s+default\b")],
+        "static":         [_rx(r"^\s*static\s+", re.MULTILINE)],
+    },
+    "ts": {
+        "async":          [_rx(r"\basync\s+(?:function|\([^)]*\)|[A-Za-z_$][\w$]*\s*=)")],
+        "generator":      [_rx(r"\bfunction\s*\*"), _rx(r"^\s*\*\s*\w+\s*\("), _rx(r"\byield\b")],
+        "abstract":       [_rx(r"\babstract\s+class\b"),
+                           _rx(r"^\s*(?:public\s+|private\s+|protected\s+)?abstract\s+\w+", re.MULTILINE)],
+        "exported":       [_rx(r"\bexport(?:\s+default)?\b")],
+        "default-export": [_rx(r"\bexport\s+default\b")],
+        "static":         [_rx(r"^\s*static\s+", re.MULTILINE)],
+    },
+    # Go has no `async` keyword (goroutines are launched via the `go` statement,
+    # which doesn't mark the *function* as async). Exported-by-capitalization
+    # is handled in the name-based branch of _detect_traits.
+    "go": {},
+    "rust": {
+        "async":      [_rx(r"\basync\s+fn\b"), _rx(r"\bpub\s+async\s+fn\b")],
+        # `pub` may sit before any combination of async/unsafe/const/extern
+        # before the actual item keyword — handle modifiers in any order.
+        "exported":   [_rx(
+            r"\bpub(?:\s*\([^)]+\))?\s+"
+            r"(?:(?:async|unsafe|const|extern\s*(?:\"[^\"]*\")?)\s+)*"
+            r"(?:fn|struct|trait|enum|mod|const|static|unsafe|type|impl|use)\b"
+        )],
+        "abstract":   [_rx(r"\btrait\s+\w+")],  # Rust traits are the closest analog.
+    },
+    "java": {
+        "abstract":   [_rx(r"\babstract\s+(?:class|interface)\b"),
+                       _rx(r"^\s*(?:public|protected|private)?\s*abstract\s+", re.MULTILINE)],
+        "static":     [_rx(r"^\s*(?:public|protected|private)?\s*(?:final\s+)?static\s+", re.MULTILINE)],
+        "exported":   [_rx(r"^\s*public\s+", re.MULTILINE)],
+    },
+    "cs": {
+        "async":      [_rx(r"\basync\s+(?:[A-Za-z<>\[\],\s.]+\s+)?\w+\s*\(")],
+        "abstract":   [_rx(r"\babstract\s+(?:class|interface)\b"),
+                       _rx(r"^\s*(?:public|protected|private|internal)?\s*abstract\s+", re.MULTILINE)],
+        "static":     [_rx(r"^\s*(?:public|protected|private|internal)?\s*static\s+", re.MULTILINE)],
+        "exported":   [_rx(r"^\s*public\s+", re.MULTILINE)],
+    },
+    "kotlin": {
+        "async":      [_rx(r"\bsuspend\s+fun\b")],
+        "abstract":   [_rx(r"\babstract\s+(?:class|fun|val|var)\b")],
+        # Kotlin defaults to public; explicit `private`/`internal`/`protected`
+        # are the negative space. Mark with `exported` only when explicit so
+        # we don't blanket-tag every entity.
+        "exported":   [_rx(r"^\s*public\s+", re.MULTILINE)],
+        "static":     [_rx(r"\b@JvmStatic\b")],
+    },
+    "swift": {
+        "async":      [_rx(r"\basync\s+func\b"),
+                       _rx(r"\bfunc\s+\w+\s*\([^)]*\)\s*(?:throws\s+)?async\b")],
+        "static":     [_rx(r"\bstatic\s+(?:func|var|let)\b"), _rx(r"\bclass\s+(?:func|var)\b")],
+        "exported":   [_rx(r"^\s*(?:public|open)\s+", re.MULTILINE)],
+    },
+    "scala": {
+        "abstract":   [_rx(r"\babstract\s+class\b"), _rx(r"^\s*trait\s+", re.MULTILINE)],
+        "exported":   [_rx(r"^\s*(?:public)?\s*(?:def|val|var|class|object|trait)\s+(?!_)\w", re.MULTILINE)],
+    },
+    "ruby": {
+        "generator":  [_rx(r"\byield\b")],
+        # Ruby has `private`/`public`/`protected` keywords that flip context.
+        # Heuristic stays narrow to avoid noise.
+    },
+    "php": {
+        "generator":  [_rx(r"\byield\b")],
+        "abstract":   [_rx(r"\babstract\s+(?:class|function)\b")],
+        "static":     [_rx(r"\bstatic\s+function\b")],
+        "exported":   [_rx(r"\bpublic\s+function\b")],
+    },
+    "cpp": {
+        "abstract":   [_rx(r"=\s*0\s*;")],  # pure virtual
+        "static":     [_rx(r"^\s*static\s+", re.MULTILINE)],
+        "exported":   [_rx(r"^\s*export\s+", re.MULTILINE)],  # C++20 modules
+    },
+    "c": {
+        "static":     [_rx(r"^\s*static\s+", re.MULTILINE)],
+        "exported":   [_rx(r"^\s*extern\s+", re.MULTILINE)],
+    },
+    "lua": {
+        # Lua's local/global is the closest analog to private/public.
+        "exported":   [_rx(r"^\s*function\s+\w+[.:]\w+", re.MULTILINE)],  # M.foo / M:foo
+    },
+    "dart": {
+        "async":      [_rx(r"\basync\s*(?:\*)?\s*\{"), _rx(r"\)\s*async\s*(?:\*)?\s*\{")],
+        "generator":  [_rx(r"\)\s*async\*\s*\{"), _rx(r"\)\s*sync\*\s*\{")],
+        "abstract":   [_rx(r"\babstract\s+class\b")],
+        "static":     [_rx(r"^\s*static\s+", re.MULTILINE)],
+        # Dart: identifiers starting with `_` are library-private; everything
+        # else is exported. Handled in the name-based branch if we extend it.
+    },
+}
+
+
+# Universal markers that fire across all language comment dialects.
+_TRAIT_PATTERNS_UNIVERSAL: list[tuple[str, re.Pattern]] = [
+    ("deprecated", _rx(
+        r"@deprecated\b|@Deprecated\b|\bDEPRECATED\b|"
+        r"#\[deprecated\b|"        # Rust
+        r"\[Obsolete\b|"           # C#
+        r"@available\([^)]*deprecated", # Swift
+        re.IGNORECASE,
+    )),
+]
+
+
 class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     """Knowledge Graph of a codebase, persisted in SQLite + FAISS.
 
@@ -737,49 +887,58 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
     @staticmethod
     def _detect_traits(name: str, snippet: str, file: str, entity_type: str) -> str:
-        """Detect language-agnostic markers from the entity head.
+        """Detect language-aware markers from the entity head.
 
         Returns a single space-separated lowercase string ('async exported')
         for cheap LIKE-based filtering downstream. Empty string when nothing
-        matches. Intentionally over-conservative — false positives bias the
-        ranking, false negatives just hide the trait.
+        matches. False positives bias ranking; false negatives hide the
+        trait — patterns are deliberately conservative.
 
-        Snippet-based detection is skipped when the snippet is empty (most
-        import/property rows). File-path-derived traits ('test') still
-        apply so test-fixture imports remain filterable.
+        Per-language detectors run only when the file extension matches.
+        Three orthogonal layers:
+          • snippet-based (regex over head[:300]) — needs a non-empty snippet
+          • name-based (Go capitalization, Python ``_`` prefix)
+          • path-based (test files) — always runs, even on empty-snippet rows
         """
-        traits: list[str] = []
+        traits: set[str] = set()
         snip = (snippet or "").strip()
         head = snip[:300]
-        if snip:
-            if re.search(r"\basync\s+(def|function|fn)\b", head):
-                traits.append("async")
-            if re.search(r"\bfunction\s*\*", head) or re.search(r"\byield\b", snip):
-                traits.append("generator")
-            if re.search(r"\babstract\s+(class|method|fn)\b", head) or "@abstractmethod" in head:
-                traits.append("abstract")
-            if re.search(r"\bexport(\s+default)?\b", head):
-                traits.append("exported")
-            if re.search(r"\bexport\s+default\b", head):
-                traits.append("default-export")
-            if re.search(r"^\s*static\s+", head, re.MULTILINE) and entity_type in {"method", "function"}:
-                traits.append("static")
-            if "@deprecated" in head.lower() or "deprecated:" in head.lower():
-                traits.append("deprecated")
-        # File-derived trait runs regardless of snippet — many JS/TS imports
-        # have no snippet body, but the file path alone (`*.test.tsx`,
-        # `**/__tests__/`) is enough to classify them as test surface.
         f_lower = (file or "").lower().replace("\\", "/")
         basename = f_lower.rsplit("/", 1)[-1]
+        suffix = "." + f_lower.rsplit(".", 1)[-1] if "." in basename else ""
+        lang = _LANG_FROM_EXT.get(suffix)
+
+        if snip and lang:
+            for trait, patterns in _TRAIT_PATTERNS_PER_LANG.get(lang, {}).items():
+                if any(p.search(head) or p.search(snip) for p in patterns):
+                    traits.add(trait)
+            # Universal patterns (deprecated marker variants across langs).
+            for trait, pattern in _TRAIT_PATTERNS_UNIVERSAL:
+                if pattern.search(snip):
+                    traits.add(trait)
+
+        # Name-based heuristics (cheap and useful even without a snippet).
+        if name:
+            if lang == "go" and name[0].isupper() and entity_type in {"function", "method", "class", "interface", "type"}:
+                traits.add("exported")
+            elif lang == "python" and not name.startswith("_") and entity_type in {"function", "method", "class"}:
+                traits.add("exported")
+
+        # Path-based test trait — language-independent.
         if (
             basename.startswith("test_") or basename.startswith("conftest")
             or basename.endswith("_test.py") or basename.endswith("_test.go")
             or basename.endswith("test.java") or basename.endswith("tests.java")
+            or basename.endswith("test.kt") or basename.endswith("tests.kt")
+            or basename.endswith("test.scala") or basename.endswith("tests.scala")
+            or basename.endswith("test.rb") or basename.endswith("_spec.rb")
+            or basename.endswith("test.cs") or basename.endswith("tests.cs")
             or ".test." in basename or ".spec." in basename
-            or any(seg in f_lower for seg in ("/tests/", "/test/", "/__tests__/", "/spec/"))
+            or any(seg in f_lower for seg in ("/tests/", "/test/", "/__tests__/", "/spec/", "/specs/"))
         ):
-            traits.append("test")
-        return " ".join(sorted(set(traits)))
+            traits.add("test")
+
+        return " ".join(sorted(traits))
 
     def rebackfill_traits(self) -> int:
         """Recompute traits for every existing entity from scratch.
