@@ -35,7 +35,7 @@ _ALLOWED_ENTITY_TYPES = {
     "class", "function", "method", "import", "module", "interface", "component",
     "hook", "type", "enum", "selector", "style", "template", "config", "variable", "symbol", "property",
     # Framework-specific (Angular / NestJS / React hooks)
-    "service", "directive", "pipe",
+    "service", "directive", "pipe", "controller",
 }
 
 _ALLOWED_RELATION_TYPES = {
@@ -851,18 +851,98 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if suffix not in {".ts", ".js"}:
             return {}
         decorator_to_type = {
+            # Angular
             "Component": "component",
             "Directive": "directive",
             "Injectable": "service",
             "NgModule": "module",
             "Pipe": "pipe",
+            # NestJS (some shared with Angular: Injectable, Pipe)
+            "Module": "module",
+            "Controller": "controller",
         }
         out: dict[str, str] = {}
-        for m in re.finditer(r"@(Component|Directive|Injectable|NgModule|Pipe)\b", code):
+        pattern = r"@(" + "|".join(re.escape(k) for k in decorator_to_type) + r")\b"
+        for m in re.finditer(pattern, code):
             tail = code[m.end() : m.end() + 4000]
             m2 = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", tail)
             if m2:
                 out[m2.group(1)] = decorator_to_type[m.group(1)]
+        return out
+
+    @staticmethod
+    def _ts_constructor_dependencies(code: str, suffix: str) -> list[tuple[str, str]]:
+        """Return [(class_name, dep_type), ...] from ``constructor(...)`` params.
+
+        Catches Angular and NestJS DI which both use the same shape:
+            constructor(private foo: FooService, public bar: BarService) {}
+        Only PascalCase types are captured (TS primitives like ``string``
+        are skipped — they don't correspond to graph entities).
+        """
+        if suffix not in {".ts", ".js"}:
+            return []
+        out: list[tuple[str, str]] = []
+        for m_class in re.finditer(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", code):
+            cls_name = m_class.group(1)
+            # Limit search window to before the next class declaration.
+            next_class = re.search(r"\bclass\s+[A-Z]", code[m_class.end():])
+            window_end = m_class.end() + (next_class.start() if next_class else len(code) - m_class.end())
+            m_ctor = re.search(r"\bconstructor\s*\(", code[m_class.end():window_end])
+            if not m_ctor:
+                continue
+            # Match the closing paren for the constructor parameter list.
+            start = m_class.end() + m_ctor.end()
+            depth = 1
+            i = start
+            while i < window_end and i < len(code) and depth > 0:
+                c = code[i]
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            params = code[start : i - 1]
+            for m_p in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*\s*:\s*([A-Z][A-Za-z0-9_]*)", params):
+                out.append((cls_name, m_p.group(1)))
+        return out
+
+    @staticmethod
+    def _module_metadata_dependencies(code: str, suffix: str) -> list[tuple[str, str]]:
+        """Return [(module_class, identifier), ...] from ``@NgModule``/``@Module`` arrays.
+
+        Looks at the declarations/imports/providers/bootstrap/controllers/
+        exports fields — anything in those arrays that looks like a class.
+        """
+        if suffix not in {".ts", ".js"}:
+            return []
+        out: list[tuple[str, str]] = []
+        for m in re.finditer(r"@(NgModule|Module)\s*\(\s*\{", code):
+            start = m.end()
+            depth = 1
+            i = start
+            while i < len(code) and depth > 0:
+                c = code[i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            body = code[start : i - 1]
+            rest = code[i : i + 4000]
+            m_cls = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", rest)
+            if not m_cls:
+                continue
+            owner = m_cls.group(1)
+            for m_arr in re.finditer(
+                r"\b(declarations|imports|providers|bootstrap|controllers|exports|entryComponents)\s*:\s*\[([^\]]*)\]",
+                body,
+            ):
+                for m_id in re.finditer(r"\b[A-Z][A-Za-z0-9_]*\b", m_arr.group(2)):
+                    out.append((owner, m_id.group(0)))
         return out
 
     def _extract_with_tree_sitter(self, filepath: Path, code: str) -> dict:
@@ -915,6 +995,36 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             relations.append({"from": rel_path, "relation": "imports", "to": target})
 
         self._extract_symbol_relations(rel_path, code, entities, relations, seen_entities, scopes)
+
+        # Angular / NestJS DI — `uses` edges from constructor-injected types
+        # and from @NgModule / @Module metadata arrays. Tree-sitter doesn't
+        # surface these on its own, but they're the dominant way deps wire
+        # up in those frameworks.
+        seen_relations = {(r.get("from", ""), r.get("relation", ""), r.get("to", "")) for r in relations}
+        for owner, dep in self._ts_constructor_dependencies(code, suffix):
+            if dep not in seen_entities:
+                seen_entities.add(dep)
+                entities.append({
+                    "name": dep,
+                    "type": self._infer_symbol_entity_type(dep),
+                    "description": "Injected via constructor",
+                })
+            key = (owner, "uses", dep)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relations.append({"from": owner, "relation": "uses", "to": dep})
+        for owner, dep in self._module_metadata_dependencies(code, suffix):
+            if dep not in seen_entities:
+                seen_entities.add(dep)
+                entities.append({
+                    "name": dep,
+                    "type": self._infer_symbol_entity_type(dep),
+                    "description": "Module metadata reference",
+                })
+            key = (owner, "uses", dep)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relations.append({"from": owner, "relation": "uses", "to": dep})
 
         return {"entities": entities, "relations": relations}
 
