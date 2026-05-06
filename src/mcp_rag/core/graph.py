@@ -1471,7 +1471,20 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # Tokenize so multi-word queries ("Layout Sider Header") don't fall
         # through as a single LIKE that nothing matches. Each token contributes
         # an OR-clause; we then favor rows that hit the most tokens.
-        tokens = [t for t in re.findall(r"[A-Za-z0-9_]+", query) if len(t) > 1]
+        # Also split CamelCase / snake_case inside each token so 'UserService'
+        # finds 'user_service' and 'render_fn' is found by 'renderFn'.
+        raw_tokens = [t for t in re.findall(r"[A-Za-z0-9_]+", query) if len(t) > 1]
+        seen: set[str] = set()
+        tokens: list[str] = []
+        for tok in raw_tokens:
+            for piece in [tok, *tok.split("_"), *re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z]+", tok)]:
+                if len(piece) < 2:
+                    continue
+                key = piece.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                tokens.append(piece)
         if not tokens:
             tokens = [query.strip()] if query.strip() else []
 
