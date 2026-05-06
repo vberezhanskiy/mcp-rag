@@ -52,6 +52,7 @@ class Services:
                 project_root=self.config.project_root,
                 graph_dir=self.config.graph_dir,
                 llm_extractor=self.llm_extractor,
+                project_config=self.config.project,
             )
         return self._graph
 
@@ -381,6 +382,92 @@ def _build_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
+            name="graph_test_coverage",
+            description=(
+                "Map production entities to the test files that exercise "
+                "them. Reverse-traverses the graph: any function/method/"
+                "class/component referenced (calls/uses/instantiates) from "
+                "a test file is marked as covered. Test files detected by "
+                "path/filename heuristics: test_*.py, *.test.tsx, *.spec.*, "
+                "**/__tests__/**, *_test.go, *Test.java, etc.\n\n"
+                "Modes:\n"
+                "  • 'summary'   — counts + by-type covered/uncovered ratios\n"
+                "  • 'uncovered' — list production defs with no test refs\n"
+                "  • 'entity'    — list tests that reference one entity\n\n"
+                "Limitations: misses dynamic dispatch and indirection through "
+                "string-based test fixtures or DI containers."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["summary", "uncovered", "entity"],
+                        "default": "summary",
+                    },
+                    "entity_name": {
+                        "type": "string",
+                        "description": "Required when mode='entity'.",
+                    },
+                    "test_globs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional override for test-file detection (default covers Python/JS/TS/Go/JVM/Rust).",
+                    },
+                    "target_path_filter": {
+                        "type": "string",
+                        "description": "Optional substring filter on production file paths (e.g. 'src/auth').",
+                    },
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                },
+            },
+        ),
+        Tool(
+            name="graph_find_clones",
+            description=(
+                "Detect clusters of near-duplicate definitions across the "
+                "codebase. Pairs are flagged when FAISS cosine similarity "
+                "is high (semantic match) AND outgoing-relation Jaccard "
+                "overlap is high (structural match: same calls/uses "
+                "downstream). Pairs are merged into clusters via "
+                "union-find; only clusters with >=2 members are returned.\n\n"
+                "Use case: 'consolidate these N implementations'. Catches "
+                "copy-pasted helpers, parallel auth flows, repeated "
+                "validation/normalization functions that text search misses."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_score": {
+                        "type": "number",
+                        "default": 0.85,
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "FAISS cosine threshold. Lower = looser semantic match, more clusters.",
+                    },
+                    "min_shape_overlap": {
+                        "type": "number",
+                        "default": 0.3,
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Jaccard threshold on outgoing (relation, target) sets. Filters out semantically-similar but structurally-different pairs.",
+                    },
+                    "top_k_per_entity": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20,
+                    },
+                    "entity_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional restriction (default: function, method, class, component, interface).",
+                    },
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+                },
+            },
+        ),
+        Tool(
             name="search_code",
             description=(
                 "Hybrid lexical + semantic search OVER CODE TEXT (not the "
@@ -504,6 +591,8 @@ _GRAPH_TOOLS_NEEDING_DATA = {
     "graph_explain",
     "graph_dead_code",
     "graph_find_similar",
+    "graph_find_clones",
+    "graph_test_coverage",
     "graph_visualize",
 }
 
@@ -840,6 +929,87 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         )
         return "\n".join(lines)
 
+    if name == "graph_test_coverage":
+        mode = (args.get("mode") or "summary").strip()
+        out = g.find_test_coverage(
+            mode=mode,
+            entity_name=args.get("entity_name"),
+            test_globs=args.get("test_globs") or None,
+            target_path_filter=args.get("target_path_filter") or None,
+            limit=int(args.get("limit", 50)),
+        )
+        if "error" in out:
+            return f"❌ {out['error']}"
+        if mode == "summary":
+            lines = [
+                f"Test coverage — {services.config.project_root.name}",
+                f"  Test files: {out['test_files']}",
+                f"  Production files: {out['production_files']}",
+                f"  Production defs: {out['production_entities']}",
+                f"  Covered: {out['covered']}  ({out['coverage_pct']:.1f}%)",
+                f"  Uncovered: {out['uncovered']}",
+            ]
+            if out["by_type"]:
+                lines.append("  By type:")
+                for t, c in sorted(out["by_type"].items()):
+                    total_t = c["covered"] + c["uncovered"]
+                    pct = (c["covered"] / total_t * 100) if total_t else 0.0
+                    lines.append(f"    - {t}: {c['covered']}/{total_t}  ({pct:.0f}%)")
+            return "\n".join(lines)
+        if mode == "uncovered":
+            items = out["uncovered"]
+            if not items:
+                return f"All production entities are covered (across {out['test_files']} test file(s))."
+            lines = [
+                f"{out['uncovered_count']} uncovered production entities "
+                f"(across {out['test_files']} test file(s)):"
+            ]
+            for e in items:
+                loc = f":{e['line_start']}" if e.get("line_start") else ""
+                lines.append(f"  • [{e['type']}] {e['name']}  ({e['file']}{loc})")
+            return "\n".join(lines)
+        # mode == "entity"
+        hits = out.get("tests") or []
+        if not hits:
+            return f"No tests reference {out['entity']!r}."
+        lines = [f"{out['test_count']} test reference(s) to {out['entity']!r}:"]
+        for h in hits:
+            lines.append(f"  • {h['file']} :: {h['from']}")
+        return "\n".join(lines)
+
+    if name == "graph_find_clones":
+        out = g.find_clones(
+            min_score=float(args.get("min_score", 0.85)),
+            min_shape_overlap=float(args.get("min_shape_overlap", 0.3)),
+            top_k_per_entity=int(args.get("top_k_per_entity", 5)),
+            entity_types=args.get("entity_types") or None,
+            limit=int(args.get("limit", 50)),
+        )
+        if out.get("warning"):
+            return out["warning"]
+        clusters = out["clusters"]
+        if not clusters:
+            return (
+                "No clone clusters above the thresholds. "
+                "Try lowering min_score or min_shape_overlap."
+            )
+        lines = [f"{len(clusters)} clone cluster(s) found:"]
+        for i, cluster in enumerate(clusters, 1):
+            lines.append(
+                f"\n## Cluster {i} — {len(cluster['members'])} members "
+                f"(avg score={cluster['avg_score']:.2f}, "
+                f"shape overlap={cluster['avg_shape_overlap']:.2f})"
+            )
+            for m in cluster["members"]:
+                loc = f":{m['line_start']}" if m.get("line_start") else ""
+                lines.append(f"  • [{m['type']}] {m['name']}  ({m['file']}{loc})")
+        lines.append(
+            "\nNote: false positives possible for legitimate parallel "
+            "implementations (test fixtures vs prod, polyfills, "
+            "interface implementations)."
+        )
+        return "\n".join(lines)
+
     if name == "graph_visualize":
         # Default to the per-project storage dir (alongside graph.db,
         # retriever cache, etc.) so the project working tree stays clean.
@@ -1143,7 +1313,100 @@ def _parse_args() -> argparse.Namespace:
         default=(os.getenv("MCP_RAG_NO_WATCH") or "").strip() in {"1", "true", "yes"},
         help="Disable the filesystem watcher (auto-reindex on edits).",
     )
+    subparsers = parser.add_subparsers(dest="command", required=False)
+    subparsers.add_parser(
+        "repl",
+        help="Interactive REPL (no MCP) — explore the graph and search from a terminal.",
+    )
     return parser.parse_args()
+
+
+# ── Interactive REPL ────────────────────────────────────────────────────────
+# Maps friendly REPL words to MCP tool names + a function that turns the rest
+# of the line into a kwargs dict. Reuses _dispatch() so REPL output is exactly
+# what an MCP client would see.
+
+def _repl_kwargs_query(rest: str) -> dict:
+    return {"query": rest.strip()} if rest.strip() else {}
+
+
+def _repl_kwargs_name(rest: str) -> dict:
+    return {"name": rest.strip()} if rest.strip() else {}
+
+
+def _repl_kwargs_entity(rest: str) -> dict:
+    return {"entity_name": rest.strip()} if rest.strip() else {}
+
+
+def _repl_kwargs_filepath(rest: str) -> dict:
+    return {"filepath": rest.strip()} if rest.strip() else {}
+
+
+def _repl_kwargs_empty(rest: str) -> dict:  # noqa: ARG001
+    return {}
+
+
+_REPL_COMMANDS: dict[str, tuple[str, callable, str]] = {
+    "search":   ("search_code",          _repl_kwargs_query,    "search <query>            hybrid BM25+dense+rerank"),
+    "find":     ("graph_search",         _repl_kwargs_query,    "find <name>               entity-name lookup"),
+    "usages":   ("graph_find_usages",    _repl_kwargs_name,     "usages <name>             callers/usages of an entity"),
+    "explain":  ("graph_explain",        _repl_kwargs_filepath, "explain <file>            file dossier"),
+    "similar":  ("graph_find_similar",   _repl_kwargs_entity,   "similar <name>            FAISS-nearest entities"),
+    "clones":   ("graph_find_clones",    _repl_kwargs_empty,    "clones                    detect clone clusters"),
+    "coverage": ("graph_test_coverage",  _repl_kwargs_empty,    "coverage                  test-coverage summary"),
+    "dead":     ("graph_dead_code",      _repl_kwargs_empty,    "dead                      possibly-dead defs"),
+    "viz":      ("graph_visualize",      _repl_kwargs_empty,    "viz                       write graph.html, open in browser"),
+    "build":    ("graph_build",          _repl_kwargs_empty,    "build                     index/refresh stale files"),
+    "stats":    ("graph_stats",          _repl_kwargs_empty,    "stats                     graph counts"),
+    "pending":  ("graph_pending_files",  _repl_kwargs_empty,    "pending                   files diverging from disk"),
+}
+
+
+def _repl_help() -> str:
+    lines = ["mcp-rag REPL — commands:"]
+    for word in sorted(_REPL_COMMANDS):
+        _, _, doc = _REPL_COMMANDS[word]
+        lines.append("  " + doc)
+    lines.append("  help, ?                    this message")
+    lines.append("  quit, exit, q              leave the REPL")
+    return "\n".join(lines)
+
+
+def _repl_run(services: Services) -> int:
+    """Blocking interactive REPL — dispatches to the same async tools the MCP
+    server exposes. Returns the process exit code (0 on clean exit)."""
+    print(f"mcp-rag REPL — project: {services.config.project_root}")
+    print("Type `help` for commands, `quit` to leave.\n")
+    loop = asyncio.new_event_loop()
+    try:
+        while True:
+            try:
+                line = input("rag> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()  # newline after ^C / ^D
+                return 0
+            if not line:
+                continue
+            if line in {"quit", "exit", "q"}:
+                return 0
+            if line in {"help", "?"}:
+                print(_repl_help())
+                continue
+            cmd, _, rest = line.partition(" ")
+            entry = _REPL_COMMANDS.get(cmd.lower())
+            if not entry:
+                print(f"Unknown command: {cmd!r}. Type `help`.")
+                continue
+            tool_name, kwargs_fn, _doc = entry
+            kwargs = kwargs_fn(rest)
+            try:
+                text = loop.run_until_complete(_dispatch(services, tool_name, kwargs))
+            except Exception as e:
+                text = f"Error in {tool_name}: {e}"
+            print(text)
+            print()  # trailing blank line so consecutive outputs don't merge
+    finally:
+        loop.close()
 
 
 def main() -> None:
@@ -1173,6 +1436,13 @@ def main() -> None:
         logger.warning("Could not attach file log handler at %s: %s", log_file, e)
 
     services = Services(config=config, llm_extractor=_resolve_llm_extractor())
+
+    if getattr(args, "command", None) == "repl":
+        # Quiet down the noisy startup logs in interactive mode — the user
+        # doesn't want eager-build progress drowning out their prompt.
+        logging.getLogger().setLevel(max(logging.WARNING, getattr(logging, args.log_level, logging.INFO)))
+        raise SystemExit(_repl_run(services))
+
     server = build_server(services)
 
     async def _run() -> None:

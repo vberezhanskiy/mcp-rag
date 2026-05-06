@@ -61,8 +61,43 @@ graph_build               # or just call any graph_* tool — it auto-builds whe
 graph_explain src/Foo.tsx # one-call file dossier
 search_code "auth flow"   # concept search across code text
 graph_find_usages User    # exact-name refactor scope
+graph_find_clones         # surface near-duplicate implementations
+graph_test_coverage       # which production defs have tests
 graph_visualize           # writes HTML, open in browser
 ```
+
+### Interactive REPL (no MCP)
+
+For terminal exploration without a Claude Code session:
+
+```
+mcp-rag --project /path/to/project repl
+rag> stats
+rag> search auth flow
+rag> usages LoginForm
+rag> clones
+rag> coverage
+rag> quit
+```
+
+---
+
+## Per-project config — `.mcp-rag.toml`
+
+Drop a `.mcp-rag.toml` at the project root to extend defaults without env-var sprawl:
+
+```toml
+[ignore]
+dirs = ["my_generated", "vendor_x"]    # extra dirs to skip during graph_build
+
+[extensions]
+extra = ["*.foo", "*.bar"]             # extra source-file extensions to index
+
+[graph]
+max_file_bytes = 10485760              # override the 5 MB skip threshold
+```
+
+The file is purely additive — anything missing falls back to defaults. Parsed once per `Config` instance; subsystems read it via `config.project`.
 
 ---
 
@@ -207,6 +242,8 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
 | Tool | What it does |
 |---|---|
 | `graph_find_similar` | Semantically nearest entities to an anchor — dedup detection. The embed text combines `name + outgoing relations + snippet`, so structural fingerprints cluster (all antd-component wrappers end up close). |
+| `graph_find_clones` | Detect clusters of near-duplicate definitions — pairs flagged when FAISS similarity AND outgoing-relation Jaccard overlap both pass thresholds. Catches copy-pasted helpers, parallel auth flows, repeated validation. |
+| `graph_test_coverage` | Reverse-traverses the graph from test files (heuristic-detected: `test_*.py`, `*.test.tsx`, `*_test.go`, …) to surface uncovered production defs. Modes: `summary`, `uncovered`, `entity`. |
 | `graph_dead_code` | Functions/classes/components no relation points at. Pass `exclude_paths` globs to skip scaffolding. |
 | `graph_get_subgraph` | BFS the relation graph around an entity. Capped per node — common names like `Layout`/`Header` produce mostly truncated nodes; reliable on uniquely-named entities. |
 | `graph_visualize` | Renders an interactive HTML page with three drill-down levels (modules → files → entities). Self-contained, vis-network from CDN. |

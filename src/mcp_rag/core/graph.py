@@ -139,6 +139,7 @@ class CodeGraph:
         project_root: str | Path,
         graph_dir: Path,
         llm_extractor: Optional[LLMExtractor] = None,
+        project_config: Optional["ProjectConfig"] = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.graph_dir = Path(graph_dir)
@@ -153,6 +154,17 @@ class CodeGraph:
         # (e.g. from the file-system watcher). Similarity tools check this
         # and trigger a rebuild before serving stale data.
         self._faiss_dirty = False
+
+        # Per-project overrides via .mcp-rag.toml (auto-loaded from the
+        # project root if not passed in).
+        if project_config is None:
+            from ..config import ProjectConfig as _PC
+            project_config = _PC.load(self.project_root)
+        self._project_config = project_config
+        self._extra_ignore_dirs: set[str] = set(project_config.extra_ignore_dirs or [])
+        self._extra_extensions: list[str] = list(project_config.extra_extensions or [])
+        self._max_file_bytes: int = project_config.max_file_bytes or _MAX_FILE_BYTES
+
         self._gitignore_parser = None
         gitignore_path = self.project_root / ".gitignore"
         if gitignore_path.exists():
@@ -213,16 +225,21 @@ class CodeGraph:
         # files like Layout.tsx/Login.tsx because their parent dir lowercase
         # contains "out"/"log".
         parts = set(path.parts)
-        return bool(parts & _IGNORE_DIRS)
+        if parts & _IGNORE_DIRS:
+            return True
+        if self._extra_ignore_dirs and (parts & self._extra_ignore_dirs):
+            return True
+        return False
 
-    @staticmethod
-    def _should_ignore_dir(name: str) -> bool:
-        return name in _IGNORE_DIRS
+    def _should_ignore_dir(self, name: str) -> bool:
+        if name in _IGNORE_DIRS:
+            return True
+        return name in self._extra_ignore_dirs
 
     def _get_files(self) -> list[Path]:
         seen: set[str] = set()
         files: list[Path] = []
-        suffixes = {ext.lstrip("*").lower() for ext in _CODE_EXTENSIONS}
+        suffixes = {ext.lstrip("*").lower() for ext in (_CODE_EXTENSIONS + self._extra_extensions)}
 
         for dirpath, dirnames, filenames in os.walk(self.project_root):
             dirnames[:] = [d for d in dirnames if not self._should_ignore_dir(d)]
@@ -718,10 +735,10 @@ class CodeGraph:
         try:
             stat = filepath.stat()
             mtime = stat.st_mtime
-            if stat.st_size > _MAX_FILE_BYTES:
+            if stat.st_size > self._max_file_bytes:
                 self._mark_file_seen(rel, mtime)
                 logger.info("Skipped %s: %.1f MB exceeds %.1f MB limit",
-                            rel, stat.st_size / 1024 / 1024, _MAX_FILE_BYTES / 1024 / 1024)
+                            rel, stat.st_size / 1024 / 1024, self._max_file_bytes / 1024 / 1024)
                 return
             code = filepath.read_text(encoding="utf-8", errors="ignore")
             if len(code.strip()) < 50:
@@ -897,7 +914,7 @@ class CodeGraph:
             import faiss
             with sqlite3.connect(self.db_path) as con:
                 rows = con.execute(
-                    "SELECT file, name, description, snippet FROM entities"
+                    "SELECT file, name, description, snippet FROM entities ORDER BY id"
                 ).fetchall()
                 # Pre-load all relations grouped by (file, from_name) so the
                 # per-entity lookup is O(1) instead of O(N²) sub-queries.
@@ -1483,6 +1500,269 @@ class CodeGraph:
              "line_start": r[4], "line_end": r[5], "snippet": r[6] or ""}
             for r in rows[:limit]
         ]
+
+    def find_clones(
+        self,
+        min_score: float = 0.85,
+        min_shape_overlap: float = 0.3,
+        top_k_per_entity: int = 5,
+        entity_types: Optional[list[str]] = None,
+        limit: int = 50,
+    ) -> dict:
+        """Detect clusters of semantically + structurally similar definitions.
+
+        Two entities are paired as clones when:
+          1. FAISS cosine similarity >= ``min_score`` (semantic match — same
+             name patterns, similar code, similar relation digest).
+          2. Outgoing-relation Jaccard overlap >= ``min_shape_overlap`` (the
+             pair calls/uses/instantiates the same downstream targets).
+
+        Pairs are merged into clusters via union-find. Single-file pairs
+        (same file, same name) are dropped — those are parsing artifacts.
+        Returns up to ``limit`` clusters sorted by tightness (avg score).
+
+        Useful for "consolidate these N implementations" refactor reviews.
+        """
+        if self.faiss_index is None or not self.faiss_names or self._faiss_dirty:
+            self._rebuild_faiss()
+        if self.faiss_index is None or self.faiss_index.ntotal == 0:
+            return {"clusters": [], "warning": "Graph FAISS index is empty — run graph_build first."}
+
+        types = set(entity_types) if entity_types else set(self._PRIMARY_DEF_TYPES)
+
+        with sqlite3.connect(self.db_path) as con:
+            all_entities = con.execute(
+                "SELECT file, name, type, line_start, line_end FROM entities ORDER BY id"
+            ).fetchall()
+            rels_rows = con.execute(
+                "SELECT file, from_name, relation, to_name FROM relations"
+            ).fetchall()
+
+        if len(all_entities) != len(self.faiss_names):
+            return {"clusters": [], "warning": "FAISS index out of sync; run graph_build."}
+
+        from collections import defaultdict
+        shape_map: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+        for f, fn, r, tn in rels_rows:
+            shape_map[(f, fn)].add((r, tn))
+
+        candidate_idxs = [
+            i for i, row in enumerate(all_entities)
+            if row[2] in types and shape_map.get((row[0], row[1]))
+        ]
+        if not candidate_idxs:
+            return {"clusters": [], "warning": None}
+
+        try:
+            import numpy as np
+            vecs = np.stack([self.faiss_index.reconstruct(int(i)) for i in candidate_idxs])
+            k = min(self.faiss_index.ntotal, max(top_k_per_entity * 4, top_k_per_entity + 2))
+            scores, neighbors = self.faiss_index.search(vecs, k)
+        except Exception as e:
+            return {"clusters": [], "warning": f"FAISS query failed: {e}"}
+
+        candidate_set = set(candidate_idxs)
+
+        # Union-find with path compression.
+        parent: dict[int, int] = {}
+
+        def find(x: int) -> int:
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: int, y: int) -> None:
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
+
+        edges: list[tuple[int, int, float, float]] = []
+        seen_pairs: set[tuple[int, int]] = set()
+
+        for q_pos, q_idx in enumerate(candidate_idxs):
+            q_row = all_entities[q_idx]
+            q_key = (q_row[0], q_row[1])
+            for score, n_idx in zip(scores[q_pos], neighbors[q_pos]):
+                n_idx = int(n_idx)
+                if n_idx < 0 or n_idx == q_idx or n_idx not in candidate_set:
+                    continue
+                if score < min_score:
+                    continue
+                pair = (min(q_idx, n_idx), max(q_idx, n_idx))
+                if pair in seen_pairs:
+                    continue
+                n_row = all_entities[n_idx]
+                # Skip pairs sharing both file AND name — same logical row.
+                if q_row[0] == n_row[0] and q_row[1] == n_row[1]:
+                    continue
+                n_key = (n_row[0], n_row[1])
+                a, b = shape_map.get(q_key, set()), shape_map.get(n_key, set())
+                union_size = len(a | b)
+                if union_size == 0:
+                    continue
+                overlap = len(a & b) / union_size
+                if overlap < min_shape_overlap:
+                    continue
+                seen_pairs.add(pair)
+                edges.append((q_idx, n_idx, float(score), overlap))
+                union(q_idx, n_idx)
+
+        if not edges:
+            return {"clusters": [], "warning": None}
+
+        cluster_pairs: dict[int, list[tuple[int, int, float, float]]] = defaultdict(list)
+        for a, b, sc, ov in edges:
+            cluster_pairs[find(a)].append((a, b, sc, ov))
+
+        out: list[dict] = []
+        for root, pair_list in cluster_pairs.items():
+            members_idx: set[int] = set()
+            for a, b, _, _ in pair_list:
+                members_idx.add(a)
+                members_idx.add(b)
+            avg_score = sum(s for _, _, s, _ in pair_list) / len(pair_list)
+            avg_overlap = sum(o for _, _, _, o in pair_list) / len(pair_list)
+            members = sorted(
+                (
+                    {
+                        "file": all_entities[i][0],
+                        "name": all_entities[i][1],
+                        "type": all_entities[i][2],
+                        "line_start": all_entities[i][3],
+                        "line_end": all_entities[i][4],
+                    }
+                    for i in members_idx
+                ),
+                key=lambda m: (m["file"], m["line_start"] or 0, m["name"]),
+            )
+            out.append({
+                "members": members,
+                "avg_score": round(avg_score, 4),
+                "avg_shape_overlap": round(avg_overlap, 4),
+                "pair_count": len(pair_list),
+            })
+
+        out.sort(key=lambda c: (c["avg_score"], c["avg_shape_overlap"]), reverse=True)
+        return {"clusters": out[:limit], "warning": None}
+
+    _DEFAULT_TEST_GLOBS = (
+        # Python
+        "test_*.py", "*_test.py", "**/tests/**", "**/test/**", "**/conftest.py",
+        # JS / TS
+        "*.test.js", "*.test.jsx", "*.test.ts", "*.test.tsx",
+        "*.spec.js", "*.spec.jsx", "*.spec.ts", "*.spec.tsx",
+        "**/__tests__/**", "**/spec/**",
+        # Go
+        "*_test.go",
+        # JVM
+        "*Test.java", "*Tests.java", "*Test.kt", "*Tests.kt",
+        # Rust
+        "**/tests/**", "**/benches/**",
+    )
+
+    @classmethod
+    def _is_test_path(cls, rel_path: str, globs: tuple[str, ...]) -> bool:
+        from fnmatch import fnmatch
+        # fnmatch doesn't understand `**`; treat it as a substring marker.
+        normalized = rel_path.replace("\\", "/")
+        for glob in globs:
+            if "**" in glob:
+                segment = glob.replace("**", "").strip("/")
+                if segment and segment in normalized:
+                    return True
+            elif fnmatch(normalized, glob) or fnmatch(normalized.split("/")[-1], glob):
+                return True
+        return False
+
+    def find_test_coverage(
+        self,
+        mode: str = "summary",
+        entity_name: Optional[str] = None,
+        test_globs: Optional[list[str]] = None,
+        target_path_filter: Optional[str] = None,
+        limit: int = 50,
+    ) -> dict:
+        """Map production entities to the test files that exercise them.
+
+        Test files are detected by path/filename heuristics
+        (``test_*.py``, ``*.test.tsx``, ``**/__tests__/**``, ``*_test.go`` etc).
+        A production entity is "covered" when at least one relation
+        (``calls`` / ``uses`` / ``instantiates``) from a test file points
+        at it.
+
+        Modes:
+          • ``summary``    — counts: tests, covered, uncovered, by-type
+          • ``uncovered``  — list production defs with no incoming test
+            references (write tests for these)
+          • ``entity``     — list tests that reference ``entity_name``
+        """
+        globs = tuple(test_globs) if test_globs else self._DEFAULT_TEST_GLOBS
+
+        with sqlite3.connect(self.db_path) as con:
+            file_rows = con.execute("SELECT DISTINCT file FROM entities").fetchall()
+            ent_rows = con.execute(
+                "SELECT file, name, type, line_start FROM entities "
+                "WHERE type IN ('function', 'method', 'class', 'component', 'interface')"
+            ).fetchall()
+            rel_rows = con.execute(
+                "SELECT file, from_name, relation, to_name FROM relations "
+                "WHERE relation IN ('calls', 'uses', 'instantiates')"
+            ).fetchall()
+
+        test_files = {f[0] for f in file_rows if self._is_test_path(f[0], globs)}
+        prod_files = {f[0] for f in file_rows if f[0] not in test_files}
+
+        # entity → set of (test_file, from_name) that reference it.
+        from collections import defaultdict
+        coverage: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        for src_file, src_name, _rel, target in rel_rows:
+            if src_file in test_files:
+                coverage[target].add((src_file, src_name))
+
+        prod_entities = [
+            {"file": f, "name": n, "type": t, "line_start": ls}
+            for f, n, t, ls in ent_rows
+            if f not in test_files
+            and (not target_path_filter or target_path_filter in f.replace("\\", "/"))
+        ]
+
+        if mode == "entity":
+            if not entity_name:
+                return {"error": "mode='entity' requires entity_name"}
+            hits = sorted(coverage.get(entity_name, set()))
+            return {
+                "entity": entity_name,
+                "test_count": len(hits),
+                "tests": [{"file": f, "from": fn} for f, fn in hits[:limit]],
+            }
+
+        covered = [e for e in prod_entities if e["name"] in coverage]
+        uncovered = [e for e in prod_entities if e["name"] not in coverage]
+
+        if mode == "uncovered":
+            return {
+                "uncovered_count": len(uncovered),
+                "test_files": len(test_files),
+                "uncovered": sorted(uncovered, key=lambda e: (e["file"], e["line_start"] or 0))[:limit],
+            }
+
+        # summary
+        by_type: dict[str, dict[str, int]] = defaultdict(lambda: {"covered": 0, "uncovered": 0})
+        for e in covered:
+            by_type[e["type"]]["covered"] += 1
+        for e in uncovered:
+            by_type[e["type"]]["uncovered"] += 1
+        total = len(prod_entities)
+        return {
+            "test_files": len(test_files),
+            "production_files": len(prod_files),
+            "production_entities": total,
+            "covered": len(covered),
+            "uncovered": len(uncovered),
+            "coverage_pct": round((len(covered) / total * 100) if total else 0.0, 1),
+            "by_type": dict(by_type),
+        }
 
     def explain_file(self, rel_path: str, top_callers: int = 5) -> dict:
         """One-shot view of a file: defined entities, deps, and who uses them."""
