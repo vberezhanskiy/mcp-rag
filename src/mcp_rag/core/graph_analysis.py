@@ -503,10 +503,23 @@ class GraphAnalysisMixin:
             }
 
         with sqlite3.connect(self.db_path) as con:
+            # Only include entities that have a `defines` edge from their
+            # own file. This drops the "phantom" rows that the symbol-relation
+            # extractor inserts whenever a file *references* a name (JSX tags,
+            # call sites, type annotations) — those would otherwise dominate
+            # PageRank with names like ReactNode/dayjs/AButton in every file
+            # that uses them.
             ent_rows = con.execute(
-                "SELECT file, name, type, line_start, line_end, snippet, description "
-                "FROM entities "
-                "WHERE type IN ('class','function','method','component','interface','module','enum')"
+                "SELECT e.file, e.name, e.type, e.line_start, e.line_end, e.snippet, e.description "
+                "FROM entities e "
+                "WHERE e.type IN ('class','function','method','component','interface','module','enum') "
+                "  AND EXISTS ("
+                "    SELECT 1 FROM relations r "
+                "    WHERE r.relation = 'defines' "
+                "      AND r.file = e.file "
+                "      AND r.from_name = e.file "
+                "      AND r.to_name = e.name"
+                "  )"
             ).fetchall()
             rel_rows = con.execute(
                 "SELECT file, from_name, relation, to_name FROM relations "
