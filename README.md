@@ -251,6 +251,9 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
 | `graph_test_coverage` | Reverse-traverses the graph from test files (heuristic-detected: `test_*.py`, `*.test.tsx`, `*_test.go`, …) to surface uncovered production defs. Modes: `summary`, `uncovered`, `entity`. |
 | `graph_repo_map` | Token-budgeted Markdown skeleton of the most-important code, ranked by personalized PageRank. Optional `focus_files` / `focus_entities` bias the ranking. Hand to an LLM at session start instead of a blind file listing. |
 | `graph_structural_search` | AST-precise pattern search via [ast-grep](https://ast-grep.github.io/). Use metavariables: `fetch($URL)` matches every fetch call. Requires `ast-grep` (or `sg`) on PATH. |
+| `graph_filter_by_trait` | Filter entities by detected markers — `async`, `generator`, `abstract`, `static`, `exported`, `default-export`, `deprecated`, `test`. Combine with `entity_types` / `path_filter`. Trait detection runs at index time + auto-back-fill for pre-existing graphs. |
+| `search_regex` | Sub-second regex over project files via SQLite FTS5 trigram pre-filter + Python `re` post-match. Closes the gap on short literals where dense retrieval smudges. Requires at least one literal alphanumeric run of 3+ chars. |
+| `metrics` | In-process counters (tool calls, errors), latency histograms (mean/p50/p95/max in ms), and gauges (FAISS size, cache hit rate). Operator visibility without standing up Prometheus. |
 | `graph_dead_code` | Functions/classes/components no relation points at. Pass `exclude_paths` globs to skip scaffolding. |
 | `graph_get_subgraph` | BFS the relation graph around an entity. Capped per node — common names like `Layout`/`Header` produce mostly truncated nodes; reliable on uniquely-named entities. |
 | `graph_visualize` | Renders an interactive HTML page with three drill-down levels (modules → files → entities). Self-contained, vis-network from CDN. |
@@ -329,6 +332,10 @@ Tested on **RTX 5060 Ti 16 GB**, Windows 11, Python 3.13, on a project of 1931 f
 - Graph build with bge-m3 + bf16: **~140s** end-to-end.
 - FAISS rebuild only: **~80s** for 42k entities.
 - `search_code` query (post-warmup): **~100–200 ms** including cross-encoder rerank.
+
+### Embedding cache (Cursor-style)
+
+Each entity's vector is keyed by `sha256(model_id + faiss_text)` and stored in the `embedding_cache` SQLite table. On rebuild after a branch switch / partial reindex, unchanged entities skip the encoder entirely. Empirically: full rebuild of a ~6.5 k-entity codebase drops from **~16 s** to **~0.1 s** on the second pass — a ~130× speedup at 100 % cache hit. Cache stats are exposed via `graph_stats` and the `metrics` tool.
 - File-watcher reindex: **~50–250 ms** per file (debounce 1s).
 
 For CPU-only setups, set `MCP_RAG_DEVICE=cpu` — works, just slower. For Apple Silicon, `MCP_RAG_DEVICE=mps` (auto-detected when available).

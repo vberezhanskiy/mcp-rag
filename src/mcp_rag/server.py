@@ -27,6 +27,7 @@ from .core.context import ContextStore
 from .core.formatter import format_memory_listing
 from .core.graph import CodeGraph
 from .core.memory import Memory, MemorySystem
+from .core.metrics import default_metrics
 from .core.retriever import MultiLangCodeRetriever
 from .llm.extractor import LLMExtractor, NoOpExtractor, OpenAICompatExtractor
 
@@ -390,6 +391,89 @@ def _build_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
+            name="metrics",
+            description=(
+                "In-process metrics snapshot — counters (tool calls, "
+                "errors), latency histograms (mean/p50/p95/max in ms), "
+                "and gauges (FAISS size, cache hit rate). Useful for "
+                "tuning batch sizes / device choice without standing up "
+                "Prometheus.\n\n"
+                "Pass `reset=true` to zero everything after the snapshot."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "reset": {"type": "boolean", "default": False},
+                },
+            },
+        ),
+        Tool(
+            name="search_regex",
+            description=(
+                "Sub-second regex search across project file content "
+                "via SQLite FTS5 trigram pre-filter + Python `re` "
+                "post-match.\n\n"
+                "Pre-filter requires at least one literal alphanumeric "
+                "run of 3+ chars in the pattern (e.g. `def\\s+test_\\w+`, "
+                "`epcp-flex`, `TODO|FIXME`). Pure meta-character patterns "
+                "are rejected to avoid full-scan degeneration.\n\n"
+                "Complements search_code (semantic) and "
+                "graph_structural_search (AST). Use when you need raw "
+                "byte-level pattern matching — short literals where "
+                "dense embedders smudge, or whole-line patterns no "
+                "tokenizer would catch."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Python regex pattern."},
+                    "file_glob": {
+                        "type": "string",
+                        "description": "Optional substring filter on result file paths.",
+                    },
+                    "case_insensitive": {"type": "boolean", "default": False},
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                },
+                "required": ["pattern"],
+            },
+        ),
+        Tool(
+            name="graph_filter_by_trait",
+            description=(
+                "Filter entities by detected traits — language-agnostic "
+                "markers extracted at index time from the entity head:\n"
+                "  • async / generator / abstract / static / deprecated\n"
+                "  • exported / default-export (TS/JS surface)\n"
+                "  • test (entity in a test file by path heuristic)\n\n"
+                "Combine with entity_types and path_filter to narrow. "
+                "Examples:\n"
+                "  ['async','exported']            — exported async APIs\n"
+                "  ['deprecated']                  — refactor backlog\n"
+                "  ['abstract'] type=class         — base classes only\n"
+                "  ['test'] negate via filter on   — write tests for missing surface\n"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "traits": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of trait tokens to require (or any of, see match).",
+                    },
+                    "match": {
+                        "type": "string",
+                        "enum": ["all", "any"],
+                        "default": "all",
+                        "description": "all = AND across traits, any = OR.",
+                    },
+                    "entity_types": {"type": "array", "items": {"type": "string"}},
+                    "path_filter": {"type": "string", "description": "Substring to match in file paths."},
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                },
+                "required": ["traits"],
+            },
+        ),
+        Tool(
             name="graph_structural_search",
             description=(
                 "AST-precise structural search via ast-grep. Patterns "
@@ -729,6 +813,7 @@ _GRAPH_TOOLS_NEEDING_DATA = {
     "graph_find_clones",
     "graph_test_coverage",
     "graph_repo_map",
+    "graph_filter_by_trait",
     "graph_visualize",
 }
 
@@ -941,6 +1026,11 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         ]
         if g.is_building:
             lines.append("  (build in progress)")
+        if stats.get("embedding_cache_rows"):
+            cache_line = f"  Embedding cache: {stats['embedding_cache_rows']:,} entries"
+            if "last_cache_hit_rate" in stats:
+                cache_line += f"  (last rebuild hit rate: {stats['last_cache_hit_rate']*100:.1f}%)"
+            lines.append(cache_line)
         if stats["by_type"]:
             lines.append("  By type:")
             for t, c in stats["by_type"].items():
@@ -1063,6 +1153,86 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             "callbacks (e.g. event handlers wired by string name) won't show "
             "incoming relations and may be false positives."
         )
+        return "\n".join(lines)
+
+    if name == "metrics":
+        # Refresh a couple of useful gauges right before snapshot so the
+        # picture is current at read time even when nothing has called
+        # the underlying tool recently.
+        try:
+            faiss = g.faiss_index
+            default_metrics.set_gauge("faiss.entities", float(faiss.ntotal if faiss else 0))
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            stats = g.get_stats()
+            default_metrics.set_gauge("graph.entities", float(stats.get("entities", 0)))
+            default_metrics.set_gauge("graph.relations", float(stats.get("relations", 0)))
+            default_metrics.set_gauge("graph.embedding_cache_rows", float(stats.get("embedding_cache_rows", 0)))
+        except Exception:  # pragma: no cover
+            pass
+        snap = default_metrics.snapshot()
+        if bool(args.get("reset")):
+            default_metrics.reset()
+        lines = ["# mcp-rag metrics"]
+        if snap["counters"]:
+            lines.append("\n## Counters")
+            for k, v in sorted(snap["counters"].items()):
+                lines.append(f"  {k}: {v}")
+        if snap["gauges"]:
+            lines.append("\n## Gauges")
+            for k, v in sorted(snap["gauges"].items()):
+                lines.append(f"  {k}: {v:g}")
+        if snap["histograms"]:
+            lines.append("\n## Latency (ms)")
+            lines.append(f"  {'metric':<40s}  count   mean    p50    p95    max")
+            for k in sorted(snap["histograms"]):
+                h = snap["histograms"][k]
+                lines.append(
+                    f"  {k:<40s}  {h['count']:>5d}  {h['mean']:>5.1f}  {h['p50']:>5.1f}  {h['p95']:>5.1f}  {h['max']:>5.1f}"
+                )
+        if len(lines) == 1:
+            lines.append("\nNo metrics recorded yet.")
+        if bool(args.get("reset")):
+            lines.append("\n_Metrics reset after snapshot._")
+        return "\n".join(lines)
+
+    if name == "search_regex":
+        out = g.search_regex(
+            pattern=str(args.get("pattern") or "").strip(),
+            file_glob=args.get("file_glob") or None,
+            case_insensitive=bool(args.get("case_insensitive")),
+            limit=int(args.get("limit", 50)),
+        )
+        if out.get("warning"):
+            return out["warning"]
+        matches = out["matches"]
+        if not matches:
+            return f"No regex matches for pattern: {args.get('pattern')!r}"
+        lines = [f"{len(matches)} regex match(es):"]
+        for m in matches:
+            lines.append(f"  • {m['file']}:{m['line']}")
+            lines.append(f"      {m['context'].rstrip()[:200]}")
+        return "\n".join(lines)
+
+    if name == "graph_filter_by_trait":
+        traits = args.get("traits") or []
+        if not isinstance(traits, list) or not traits:
+            return "❌ traits must be a non-empty list."
+        rows = g.find_by_trait(
+            traits=[str(t) for t in traits],
+            entity_types=args.get("entity_types") or None,
+            path_filter=args.get("path_filter") or None,
+            limit=int(args.get("limit", 50)),
+            match=str(args.get("match") or "all"),
+        )
+        if not rows:
+            return f"No entities with traits {traits} (match={args.get('match', 'all')})."
+        lines = [f"{len(rows)} entities matching traits {traits}:"]
+        for r in rows:
+            loc = f":{r['line_start']}" if r.get("line_start") else ""
+            tags = " ".join(f"#{t}" for t in r.get("traits") or [])
+            lines.append(f"  • [{r['type']}] {r['name']}  ({r['file']}{loc})  {tags}")
         return "\n".join(lines)
 
     if name == "graph_structural_search":
@@ -1454,9 +1624,12 @@ def build_server(services: Services) -> Server:
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        default_metrics.inc(f"tool.{name}.calls")
         try:
-            text = await _dispatch(services, name, arguments or {})
+            with default_metrics.timer(f"tool.{name}"):
+                text = await _dispatch(services, name, arguments or {})
         except Exception as e:
+            default_metrics.inc(f"tool.{name}.errors")
             logger.exception("Tool %s failed", name)
             text = f"Error in {name}: {e}"
         return [TextContent(type="text", text=text)]
@@ -1596,7 +1769,9 @@ _REPL_COMMANDS: dict[str, tuple[str, callable, str]] = {
     "coverage": ("graph_test_coverage",  _repl_kwargs_empty,    "coverage                  test-coverage summary"),
     "repomap":  ("graph_repo_map",       _repl_kwargs_empty,    "repomap                   PageRank-ranked project skeleton"),
     "struct":   ("graph_structural_search", _repl_kwargs_pattern, "struct <pattern>          ast-grep structural search"),
+    "regex":    ("search_regex",         _repl_kwargs_pattern,  "regex <pattern>           FTS5-trigram + Python re search"),
     "contexts": ("context_list",         _repl_kwargs_empty,    "contexts                  list saved retrieval bundles"),
+    "metrics":  ("metrics",              _repl_kwargs_empty,    "metrics                   in-process counters/latency/gauges"),
     "dead":     ("graph_dead_code",      _repl_kwargs_empty,    "dead                      possibly-dead defs"),
     "viz":      ("graph_visualize",      _repl_kwargs_empty,    "viz                       write graph.html, open in browser"),
     "build":    ("graph_build",          _repl_kwargs_empty,    "build                     index/refresh stale files"),

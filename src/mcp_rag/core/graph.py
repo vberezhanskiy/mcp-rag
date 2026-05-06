@@ -205,6 +205,13 @@ class CodeGraph:
                 CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_name);
                 CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_name);
                 CREATE INDEX IF NOT EXISTS idx_entities_file ON entities(file);
+                CREATE TABLE IF NOT EXISTS embedding_cache (
+                    hash    TEXT NOT NULL,
+                    model   TEXT NOT NULL,
+                    dim     INTEGER NOT NULL,
+                    vec     BLOB NOT NULL,
+                    PRIMARY KEY (hash, model)
+                );
             """)
             columns = {row[1] for row in con.execute("PRAGMA table_info(entities)").fetchall()}
             if "line_start" not in columns:
@@ -213,6 +220,29 @@ class CodeGraph:
                 con.execute("ALTER TABLE entities ADD COLUMN line_end INTEGER")
             if "snippet" not in columns:
                 con.execute("ALTER TABLE entities ADD COLUMN snippet TEXT DEFAULT ''")
+            if "traits" not in columns:
+                con.execute("ALTER TABLE entities ADD COLUMN traits TEXT DEFAULT ''")
+                con.execute("CREATE INDEX IF NOT EXISTS idx_entities_traits ON entities(traits)")
+            # Run trait back-fill independently of the ALTER above so the
+            # upgrade also lights up for users whose prior session added
+            # the column but didn't have the back-fill code yet.
+            has_any = con.execute(
+                "SELECT 1 FROM entities WHERE COALESCE(traits, '') != '' LIMIT 1"
+            ).fetchone()
+            if has_any is None:
+                rows = con.execute(
+                    "SELECT rowid, file, name, type, snippet FROM entities "
+                    "WHERE COALESCE(snippet, '') != ''"
+                ).fetchall()
+                updated = 0
+                for rid, f, n, t, sn in rows:
+                    traits = self._detect_traits(n or "", sn or "", f or "", t or "")
+                    if traits:
+                        con.execute("UPDATE entities SET traits = ? WHERE rowid = ?", (traits, rid))
+                        updated += 1
+                if updated:
+                    con.commit()
+                    logger.info("Back-filled traits for %d existing entities.", updated)
 
     def _should_ignore(self, path: Path) -> bool:
         if self._gitignore_parser is not None:
@@ -695,11 +725,55 @@ class CodeGraph:
         rel_path = filepath.relative_to(self.project_root).as_posix()
         return await self.llm_extractor.extract(rel_path, code), "llm"
 
+    @staticmethod
+    def _detect_traits(name: str, snippet: str, file: str, entity_type: str) -> str:
+        """Detect language-agnostic markers from the entity head.
+
+        Returns a single space-separated lowercase string ('async exported')
+        for cheap LIKE-based filtering downstream. Empty string when nothing
+        matches. Intentionally over-conservative — false positives bias the
+        ranking, false negatives just hide the trait.
+        """
+        snip = (snippet or "").strip()
+        if not snip:
+            return ""
+        head = snip[:300]
+        traits: list[str] = []
+        if re.search(r"\basync\s+(def|function|fn)\b", head):
+            traits.append("async")
+        if re.search(r"\bfunction\s*\*", head) or re.search(r"\byield\b", snip):
+            traits.append("generator")
+        if re.search(r"\babstract\s+(class|method|fn)\b", head) or "@abstractmethod" in head:
+            traits.append("abstract")
+        if re.search(r"\bexport(\s+default)?\b", head):
+            traits.append("exported")
+        if re.search(r"\bexport\s+default\b", head):
+            traits.append("default-export")
+        if re.search(r"^\s*static\s+", head, re.MULTILINE) and entity_type in {"method", "function"}:
+            traits.append("static")
+        if "@deprecated" in head.lower() or "deprecated:" in head.lower():
+            traits.append("deprecated")
+        # File-derived trait (cheap and useful for filtering test/prod surfaces).
+        f_lower = (file or "").lower().replace("\\", "/")
+        basename = f_lower.rsplit("/", 1)[-1]
+        if (
+            basename.startswith("test_") or basename.startswith("conftest")
+            or basename.endswith("_test.py") or basename.endswith("_test.go")
+            or basename.endswith("test.java") or basename.endswith("tests.java")
+            or ".test." in basename or ".spec." in basename
+            or any(seg in f_lower for seg in ("/tests/", "/test/", "/__tests__/", "/spec/"))
+        ):
+            traits.append("test")
+        return " ".join(sorted(set(traits)))
+
     def _store_extracted(self, rel_path: str, mtime: float, data: dict) -> None:
         with sqlite3.connect(self.db_path) as con:
             for e in data.get("entities", []):
+                traits = self._detect_traits(
+                    e.get("name", ""), e.get("snippet", ""), rel_path, e.get("type", ""),
+                )
                 con.execute(
-                    "INSERT OR REPLACE INTO entities(file, name, type, description, line_start, line_end, snippet) VALUES(?,?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO entities(file, name, type, description, line_start, line_end, snippet, traits) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         rel_path,
                         e.get("name", ""),
@@ -708,6 +782,7 @@ class CodeGraph:
                         e.get("line_start"),
                         e.get("line_end"),
                         e.get("snippet", ""),
+                        traits,
                     ),
                 )
             for r in data.get("relations", []):
@@ -937,14 +1012,65 @@ class CodeGraph:
                 for r in rows
             ]
             self.faiss_names = [r[1] for r in rows]
-            embeddings = encode_documents(
-                texts, normalize_embeddings=True,
-                show_progress_bar=False, batch_size=encode_batch_size(),
-            ).astype("float32")
+
+            # Content-addressable cache (Cursor-style Merkle reuse): each
+            # entity's embedding is keyed by sha256(text + model_id). On
+            # branch switches / partial reindexes most rows hit the cache
+            # and skip the encoder entirely.
+            import hashlib
+            from .embedder import _embed_model_id
+            model_id = _embed_model_id()
+            hashes = [hashlib.sha256(f"{model_id}\n{t}".encode("utf-8")).hexdigest()[:32] for t in texts]
+            cached_vecs: dict[str, "np.ndarray"] = {}
+            with sqlite3.connect(self.db_path) as con:
+                # Look up in batches — SQLite caps `IN (?,?,...)` at ~999 params.
+                unique_hashes = list({h for h in hashes})
+                for i in range(0, len(unique_hashes), 800):
+                    batch = unique_hashes[i:i + 800]
+                    placeholders = ",".join("?" * len(batch))
+                    rows_c = con.execute(
+                        f"SELECT hash, vec, dim FROM embedding_cache "
+                        f"WHERE model = ? AND hash IN ({placeholders})",
+                        (model_id, *batch),
+                    ).fetchall()
+                    for h, blob, _dim in rows_c:
+                        import numpy as _np
+                        cached_vecs[h] = _np.frombuffer(blob, dtype=_np.float32)
+
+            missing_idxs = [i for i, h in enumerate(hashes) if h not in cached_vecs]
+            cache_hits = len(hashes) - len(missing_idxs)
+            self._last_cache_hits = cache_hits
+            self._last_cache_total = len(hashes)
+
+            if missing_idxs:
+                missing_texts = [texts[i] for i in missing_idxs]
+                new_vecs = encode_documents(
+                    missing_texts, normalize_embeddings=True,
+                    show_progress_bar=False, batch_size=encode_batch_size(),
+                ).astype("float32")
+                for pos, src_idx in enumerate(missing_idxs):
+                    cached_vecs[hashes[src_idx]] = new_vecs[pos]
+                # Persist new entries.
+                with sqlite3.connect(self.db_path) as con:
+                    con.executemany(
+                        "INSERT OR REPLACE INTO embedding_cache(hash, model, dim, vec) VALUES (?, ?, ?, ?)",
+                        [
+                            (hashes[i], model_id, int(new_vecs.shape[1]), new_vecs[pos].tobytes())
+                            for pos, i in enumerate(missing_idxs)
+                        ],
+                    )
+                    con.commit()
+
+            import numpy as np
+            embeddings = np.stack([cached_vecs[h] for h in hashes]).astype("float32")
             dim = embeddings.shape[1]
             self.faiss_index = faiss.IndexFlatIP(dim)
             self.faiss_index.add(embeddings)
-            logger.info("FAISS index built: %d entities (rels-enriched)", len(self.faiss_names))
+            logger.info(
+                "FAISS index built: %d entities  (cache hits %d/%d = %.1f%%)",
+                len(self.faiss_names), cache_hits, len(hashes),
+                (cache_hits / max(len(hashes), 1)) * 100,
+            )
         except Exception as e:
             self.faiss_index = None
             self.faiss_names = []
@@ -1319,7 +1445,17 @@ class CodeGraph:
             types = con.execute(
                 "SELECT type, COUNT(*) FROM entities GROUP BY type ORDER BY COUNT(*) DESC"
             ).fetchall()
-        return {"files": f, "entities": e, "relations": r, "by_type": {t: c for t, c in types}}
+            try:
+                cache_rows = con.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0]
+            except sqlite3.OperationalError:
+                cache_rows = 0
+        out = {"files": f, "entities": e, "relations": r, "by_type": {t: c for t, c in types}}
+        out["embedding_cache_rows"] = cache_rows
+        if hasattr(self, "_last_cache_total") and self._last_cache_total:
+            out["last_cache_hit_rate"] = round(
+                self._last_cache_hits / self._last_cache_total, 4
+            )
+        return out
 
     # Types whose snippets carry actual definition semantics. Imports and
     # property/symbol references usually point at one line of an import
@@ -1763,6 +1899,183 @@ class CodeGraph:
             "coverage_pct": round((len(covered) / total * 100) if total else 0.0, 1),
             "by_type": dict(by_type),
         }
+
+    def _ensure_text_index(self) -> int:
+        """Lazily build the FTS5 trigram chunk index for regex search.
+
+        Returns the number of chunks indexed. A chunk is a 100-line slice
+        of a project file; the trigram tokenizer makes any-substring
+        MATCH sub-second on millions of lines. Idempotent — re-runs with
+        no-op when the table already has rows.
+        """
+        with sqlite3.connect(self.db_path) as con:
+            # Probe table existence + row count.
+            try:
+                count = con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+                if count > 0:
+                    return count
+            except sqlite3.OperationalError:
+                con.execute(
+                    "CREATE VIRTUAL TABLE chunks_fts USING fts5("
+                    "content, file UNINDEXED, line_start UNINDEXED, "
+                    "tokenize='trigram')"
+                )
+
+        chunks: list[tuple[str, str, int]] = []
+        chunk_lines = 100
+        for path in self._get_files():
+            try:
+                stat = path.stat()
+                if stat.st_size > self._max_file_bytes:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            rel = path.relative_to(self.project_root).as_posix()
+            lines = text.splitlines()
+            for i in range(0, len(lines), chunk_lines):
+                chunk = "\n".join(lines[i:i + chunk_lines])
+                if chunk.strip():
+                    chunks.append((chunk, rel, i + 1))
+
+        if chunks:
+            with sqlite3.connect(self.db_path) as con:
+                con.executemany(
+                    "INSERT INTO chunks_fts(content, file, line_start) VALUES (?,?,?)",
+                    chunks,
+                )
+                con.commit()
+        logger.info("FTS5 trigram chunk index built: %d chunks", len(chunks))
+        return len(chunks)
+
+    def search_regex(
+        self,
+        pattern: str,
+        file_glob: Optional[str] = None,
+        case_insensitive: bool = False,
+        limit: int = 50,
+    ) -> dict:
+        """Regex search via FTS5 trigram pre-filter + Python re post-match.
+
+        Required: at least one literal alphanumeric run of 3+ characters
+        in the pattern (used as the trigram pre-filter). Patterns of
+        only meta-characters are rejected to avoid degenerating into a
+        full scan.
+
+        Use case: short literal hunts (`epcp-flex`, `__brand__`) where
+        the dense embedder smudges, plus structural patterns where you
+        need raw regex (`def\s+test_\w+\(`).
+        """
+        self._ensure_text_index()
+
+        literal_runs = re.findall(r"[A-Za-z0-9_]{3,}", pattern)
+        if not literal_runs:
+            return {
+                "matches": [],
+                "warning": (
+                    "Pattern has no literal alphanumeric run of 3+ chars — "
+                    "FTS5 trigram pre-filter would degenerate to a full scan. "
+                    "Add at least one literal substring (e.g. 'def\\s+helper')."
+                ),
+            }
+
+        # FTS5 'phrase phrase' syntax = AND. Cap to ~6 phrases to keep query short.
+        # Sanitize: escape any double-quote in the literals (they shouldn't appear in
+        # alphanumeric runs but be defensive).
+        safe_runs = [run.replace('"', '""') for run in literal_runs[:6]]
+        fts_expr = " ".join(f'"{run}"' for run in safe_runs)
+
+        flags = re.IGNORECASE if case_insensitive else 0
+        try:
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            return {"matches": [], "warning": f"Invalid regex: {e}"}
+
+        matches: list[dict] = []
+        with sqlite3.connect(self.db_path) as con:
+            try:
+                cursor = con.execute(
+                    "SELECT file, line_start, content FROM chunks_fts "
+                    "WHERE chunks_fts MATCH ? LIMIT ?",
+                    (fts_expr, limit * 20),
+                )
+            except sqlite3.OperationalError as e:
+                return {"matches": [], "warning": f"FTS5 MATCH failed: {e}"}
+
+            for file_path, line_start, content in cursor:
+                if file_glob and file_glob not in file_path:
+                    continue
+                for m in rx.finditer(content):
+                    line_offset = content[:m.start()].count("\n")
+                    line_no = (line_start or 0) + line_offset
+                    line_lo = content.rfind("\n", 0, m.start()) + 1
+                    line_hi = content.find("\n", m.end())
+                    if line_hi == -1:
+                        line_hi = len(content)
+                    matches.append({
+                        "file": file_path,
+                        "line": line_no,
+                        "match": m.group(0)[:200],
+                        "context": content[line_lo:line_hi][:300],
+                    })
+                    if len(matches) >= limit:
+                        break
+                if len(matches) >= limit:
+                    break
+
+        return {"matches": matches, "warning": None}
+
+    def text_index_clear(self) -> None:
+        """Drop the FTS5 trigram index (forces a rebuild on next call)."""
+        with sqlite3.connect(self.db_path) as con:
+            try:
+                con.execute("DROP TABLE IF EXISTS chunks_fts")
+                con.execute("VACUUM")
+            except sqlite3.OperationalError:
+                pass
+
+    def find_by_trait(
+        self,
+        traits: list[str],
+        entity_types: Optional[list[str]] = None,
+        path_filter: Optional[str] = None,
+        limit: int = 50,
+        match: str = "all",
+    ) -> list[dict]:
+        """Filter entities by detected traits (async/generator/abstract/...).
+
+        ``match='all'`` requires every trait; ``match='any'`` returns
+        entities carrying at least one. Combine with ``entity_types`` to
+        narrow further (e.g. async functions only).
+        """
+        traits = [t.strip().lower() for t in (traits or []) if t.strip()]
+        if not traits:
+            return []
+        type_filter = list(entity_types or [])
+        clauses: list[str] = []
+        params: list = []
+        for t in traits:
+            clauses.append("instr(' ' || COALESCE(traits, '') || ' ', ?) > 0")
+            params.append(f" {t} ")
+        joiner = " AND " if match == "all" else " OR "
+        where = "(" + joiner.join(clauses) + ")"
+        if type_filter:
+            where += " AND type IN (" + ",".join("?" * len(type_filter)) + ")"
+            params.extend(type_filter)
+        if path_filter:
+            where += " AND file LIKE ?"
+            params.append(f"%{path_filter}%")
+        with sqlite3.connect(self.db_path) as con:
+            rows = con.execute(
+                f"SELECT file, name, type, line_start, line_end, traits FROM entities "
+                f"WHERE {where} ORDER BY file, line_start LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [
+            {"file": r[0], "name": r[1], "type": r[2],
+             "line_start": r[3], "line_end": r[4], "traits": (r[5] or "").split()}
+            for r in rows
+        ]
 
     _ASTGREP_LANG_FROM_EXT = {
         ".py": "python", ".js": "javascript", ".jsx": "javascript",
