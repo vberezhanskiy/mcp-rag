@@ -65,6 +65,10 @@ class OpenAICompatExtractor:
       MCP_RAG_LLM_BASE_URL — e.g. https://api.deepseek.com/v1
       MCP_RAG_LLM_API_KEY  — bearer token
       MCP_RAG_LLM_MODEL    — model id (defaults to "deepseek-chat")
+
+    Subclass and override `_endpoint_url()` / `_request_headers()` to plug in
+    proxies that need a different URL shape or extra auth headers (e.g. when
+    routing through a SaaS bearer + provider-selection header).
     """
 
     def __init__(
@@ -73,16 +77,32 @@ class OpenAICompatExtractor:
         api_key: str | None = None,
         model: str | None = None,
         timeout: float = 120.0,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = (base_url or os.getenv("MCP_RAG_LLM_BASE_URL", "")).rstrip("/")
         self.api_key = api_key or os.getenv("MCP_RAG_LLM_API_KEY", "")
         self.model = model or os.getenv("MCP_RAG_LLM_MODEL", "deepseek-chat")
         self.timeout = timeout
-        if not self.base_url or not self.api_key:
+        self.extra_headers = dict(extra_headers or {})
+
+    def _endpoint_url(self) -> str:
+        if not self.base_url:
             raise ValueError(
-                "OpenAICompatExtractor requires base_url and api_key "
-                "(or MCP_RAG_LLM_BASE_URL / MCP_RAG_LLM_API_KEY env)."
+                "base_url is required (or MCP_RAG_LLM_BASE_URL env)"
             )
+        return f"{self.base_url}/chat/completions"
+
+    def _request_headers(self) -> dict[str, str]:
+        if not self.api_key:
+            raise ValueError(
+                "api_key is required (or MCP_RAG_LLM_API_KEY env)"
+            )
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        headers.update(self.extra_headers)
+        return headers
 
     async def extract(self, rel_path: str, code: str) -> dict:
         try:
@@ -96,11 +116,8 @@ class OpenAICompatExtractor:
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(
-                    f"{self.base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
+                    self._endpoint_url(),
+                    headers=self._request_headers(),
                     json={
                         "model": self.model,
                         "messages": [{"role": "user", "content": prompt}],
@@ -114,7 +131,7 @@ class OpenAICompatExtractor:
                 return {"entities": [], "relations": []}
             text = resp.json()["choices"][0]["message"]["content"].strip()
             text = _strip_code_fence(text)
-            return json.loads(text)
+            return _parse_json_lenient(text)
         except Exception as e:
             logger.warning("LLM extract failed for %s: %s", rel_path, e)
             return {"entities": [], "relations": []}
@@ -125,3 +142,18 @@ def _strip_code_fence(text: str) -> str:
         return text
     m = re.search(r"```(?:json|json5)?\s*(.+?)```", text, re.DOTALL)
     return m.group(1).strip() if m else text
+
+
+def _parse_json_lenient(text: str) -> dict:
+    """Parse JSON, falling back to json5 (trailing commas, comments) if available."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import json5  # type: ignore[import-not-found]
+        except ImportError:
+            return {"entities": [], "relations": []}
+        try:
+            return json5.loads(text)
+        except Exception:
+            return {"entities": [], "relations": []}

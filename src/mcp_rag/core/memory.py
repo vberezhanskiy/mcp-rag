@@ -8,7 +8,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import faiss
 import numpy as np
@@ -148,7 +148,7 @@ class MemorySystem:
 
         for mem in self.memories:
             try:
-                self._md_path_for(mem).write_text(self._render_md(mem), encoding="utf-8")
+                self.md_path_for(mem).write_text(self._render_md(mem), encoding="utf-8")
             except Exception as e:
                 logger.warning("Failed to write memory %s: %s", mem.id, e)
 
@@ -215,7 +215,14 @@ class MemorySystem:
             out[key] = value.strip("'\"")
         return out
 
-    def _md_path_for(self, mem: Memory) -> Path:
+    def md_path_for(self, mem: Memory) -> Path:
+        """Absolute path to the per-memory ``.md`` file on disk.
+
+        Stable across saves: the filename pattern is
+        ``<type>__<id>__<slug>.md``. Callers can hand this path to a tool
+        like ``read_file`` to drill into the full body when only a snippet
+        is shown in search results.
+        """
         return self.md_dir / f"{mem.memory_type}__{mem.id}__{self._slug(mem.content)}.md"
 
     @staticmethod
@@ -269,7 +276,7 @@ class MemorySystem:
             )
             lines.append(f"## {memory_type} ({len(entries)})")
             for mem in entries:
-                rel = self._md_path_for(mem).relative_to(self.memory_dir).as_posix()
+                rel = self.md_path_for(mem).relative_to(self.memory_dir).as_posix()
                 lines.append(f"- [{mem.id}]({rel}) — {self._one_line_hook(mem.content)}")
             lines.append("")
         return "\n".join(lines)
@@ -362,6 +369,47 @@ class MemorySystem:
 
     def add_memory(self, memory: Memory, rebuild_index: bool = True) -> str:
         return self.add_or_update_memory(memory, rebuild_index=rebuild_index)
+
+    def replace_where(
+        self,
+        predicate: Callable[[Memory], bool],
+        new_memory: Memory,
+        rebuild_index: bool = True,
+    ) -> bool:
+        """Drop every record matching ``predicate`` (except one that already
+        equals ``new_memory``), then ensure ``new_memory`` is present.
+
+        Idempotent: a second identical call returns False and does no I/O.
+
+        Returns True when the live list actually changed.
+        """
+        normalized_new = self._normalize_content(new_memory.content)
+
+        # A row matching the predicate but identical to the new memory is
+        # the same logical record — keep it instead of churning disk.
+        to_drop_ids = {
+            id(m)
+            for m in self.memories
+            if predicate(m) and self._normalize_content(m.content) != normalized_new
+        }
+        filtered = [m for m in self.memories if id(m) not in to_drop_ids]
+        already_present = any(
+            self._normalize_content(m.content) == normalized_new for m in filtered
+        )
+
+        if not to_drop_ids and already_present:
+            return False
+
+        if not already_present:
+            filtered.append(new_memory)
+
+        self.memories = filtered
+        self._save_memories()
+        if rebuild_index:
+            self._build_index()
+        else:
+            self._index_dirty = True
+        return True
 
     def add_memories_batch(self, memories: List[Memory]) -> dict:
         added = 0
