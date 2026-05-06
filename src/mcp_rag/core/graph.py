@@ -656,6 +656,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     @staticmethod
     def _infer_tree_sitter_entity_type(node_type: str, name: str, rel_path: str, suffix: str) -> str:
         node_type = (node_type or "").lower()
+        is_jsx_file = suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"}
+        is_pascal = bool(name) and name[:1].isupper()
+        # In JSX/TSX files, PascalCase function or class declarations are
+        # React components — classify them as such so entity_type='component'
+        # filters work the way users expect (Button, Modal, AntdTable, …).
+        if is_jsx_file and is_pascal and ("class" in node_type or "function" in node_type):
+            return "component"
         if "class" in node_type:
             return "class"
         if "method" in node_type:
