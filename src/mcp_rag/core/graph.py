@@ -743,27 +743,32 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         for cheap LIKE-based filtering downstream. Empty string when nothing
         matches. Intentionally over-conservative — false positives bias the
         ranking, false negatives just hide the trait.
+
+        Snippet-based detection is skipped when the snippet is empty (most
+        import/property rows). File-path-derived traits ('test') still
+        apply so test-fixture imports remain filterable.
         """
-        snip = (snippet or "").strip()
-        if not snip:
-            return ""
-        head = snip[:300]
         traits: list[str] = []
-        if re.search(r"\basync\s+(def|function|fn)\b", head):
-            traits.append("async")
-        if re.search(r"\bfunction\s*\*", head) or re.search(r"\byield\b", snip):
-            traits.append("generator")
-        if re.search(r"\babstract\s+(class|method|fn)\b", head) or "@abstractmethod" in head:
-            traits.append("abstract")
-        if re.search(r"\bexport(\s+default)?\b", head):
-            traits.append("exported")
-        if re.search(r"\bexport\s+default\b", head):
-            traits.append("default-export")
-        if re.search(r"^\s*static\s+", head, re.MULTILINE) and entity_type in {"method", "function"}:
-            traits.append("static")
-        if "@deprecated" in head.lower() or "deprecated:" in head.lower():
-            traits.append("deprecated")
-        # File-derived trait (cheap and useful for filtering test/prod surfaces).
+        snip = (snippet or "").strip()
+        head = snip[:300]
+        if snip:
+            if re.search(r"\basync\s+(def|function|fn)\b", head):
+                traits.append("async")
+            if re.search(r"\bfunction\s*\*", head) or re.search(r"\byield\b", snip):
+                traits.append("generator")
+            if re.search(r"\babstract\s+(class|method|fn)\b", head) or "@abstractmethod" in head:
+                traits.append("abstract")
+            if re.search(r"\bexport(\s+default)?\b", head):
+                traits.append("exported")
+            if re.search(r"\bexport\s+default\b", head):
+                traits.append("default-export")
+            if re.search(r"^\s*static\s+", head, re.MULTILINE) and entity_type in {"method", "function"}:
+                traits.append("static")
+            if "@deprecated" in head.lower() or "deprecated:" in head.lower():
+                traits.append("deprecated")
+        # File-derived trait runs regardless of snippet — many JS/TS imports
+        # have no snippet body, but the file path alone (`*.test.tsx`,
+        # `**/__tests__/`) is enough to classify them as test surface.
         f_lower = (file or "").lower().replace("\\", "/")
         basename = f_lower.rsplit("/", 1)[-1]
         if (
@@ -775,6 +780,27 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         ):
             traits.append("test")
         return " ".join(sorted(set(traits)))
+
+    def rebackfill_traits(self) -> int:
+        """Recompute traits for every existing entity from scratch.
+
+        Useful after upgrading mcp-rag to pick up improved trait
+        detection without a full ``graph_clear + graph_build``. Returns
+        the number of rows that ended up with a non-empty traits string.
+        """
+        with sqlite3.connect(self.db_path) as con:
+            rows = con.execute(
+                "SELECT rowid, file, name, type, COALESCE(snippet, '') FROM entities"
+            ).fetchall()
+            updated = 0
+            for rid, f, n, t, sn in rows:
+                traits = self._detect_traits(n or "", sn or "", f or "", t or "")
+                con.execute("UPDATE entities SET traits = ? WHERE rowid = ?", (traits, rid))
+                if traits:
+                    updated += 1
+            con.commit()
+        logger.info("rebackfill_traits: tagged %d / %d entities.", updated, len(rows))
+        return updated
 
     def _store_extracted(self, rel_path: str, mtime: float, data: dict) -> None:
         with sqlite3.connect(self.db_path) as con:

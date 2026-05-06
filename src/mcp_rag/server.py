@@ -438,6 +438,17 @@ def _build_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="graph_rebackfill_traits",
+            description=(
+                "Recompute the `traits` column for every existing entity "
+                "using the current detection logic. Use after upgrading "
+                "mcp-rag to pick up improved heuristics without a full "
+                "graph_clear + graph_build cycle. Returns the number of "
+                "tagged rows."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
             name="graph_filter_by_trait",
             description=(
                 "Filter entities by detected traits — language-agnostic "
@@ -1214,6 +1225,16 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             lines.append(f"  • {m['file']}:{m['line']}")
             lines.append(f"      {m['context'].rstrip()[:200]}")
         return "\n".join(lines)
+
+    if name == "graph_rebackfill_traits":
+        try:
+            tagged = g.rebackfill_traits()
+        except Exception as e:
+            return f"❌ rebackfill failed: {e}"
+        return (
+            f"✅ Recomputed traits — {tagged} of the existing entities ended up tagged.\n"
+            f"   Run graph_filter_by_trait next to query them."
+        )
 
     if name == "graph_filter_by_trait":
         traits = args.get("traits") or []
