@@ -190,6 +190,24 @@ _TRAIT_PATTERNS_PER_LANG: dict[str, dict[str, list[re.Pattern]]] = {
         "exported":       [_rx(r"\bexport(?:\s+default)?\b")],
         "default-export": [_rx(r"\bexport\s+default\b")],
         "static":         [_rx(r"^\s*static\s+", re.MULTILINE)],
+        # Angular: classic decorator-style + new signal-style class members.
+        # Match in any order; multiple traits can fire on the same entity
+        # (e.g. `= input(` produces both `input` and `signal`).
+        "input":          [_rx(r"@Input\b"),
+                           _rx(r"=\s*input(?:\.required)?\s*[<(]"),
+                           _rx(r"=\s*model(?:\.required)?\s*[<(]")],
+        "output":         [_rx(r"@Output\b"),
+                           _rx(r"=\s*output\s*[<(]")],
+        "signal":         [_rx(r"=\s*signal\s*[<(]"),
+                           _rx(r"=\s*input(?:\.required)?\s*[<(]"),
+                           _rx(r"=\s*output\s*[<(]"),
+                           _rx(r"=\s*model(?:\.required)?\s*[<(]"),
+                           _rx(r"=\s*computed\s*[<(]")],
+        "computed":       [_rx(r"=\s*computed\s*[<(]")],
+        "effect":         [_rx(r"\beffect\s*\(")],
+        "viewchild":      [_rx(r"@(?:ViewChild|ViewChildren|ContentChild|ContentChildren)\b"),
+                           _rx(r"=\s*(?:viewChild|contentChild)(?:\.required)?\s*[<(]")],
+        "injected":       [_rx(r"=\s*inject\s*\(")],
     },
     # Go has no `async` keyword (goroutines are launched via the `go` statement,
     # which doesn't mark the *function* as async). Exported-by-capitalization
@@ -632,7 +650,16 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
         for tag in re.findall(r"<([A-Za-z][A-Za-z0-9:_-]*)", code):
             entity_type = "component" if ("-" in tag or ":" in tag) else "template"
-            _add_entity(tag, entity_type, "Template tag")
+            tag_norm = self._normalize_whitespace(tag, limit=160)
+            if not tag_norm:
+                continue
+            if tag_norm not in seen_entities:
+                seen_entities.add(tag_norm)
+                entities.append({"name": tag_norm, "type": entity_type, "description": "Template tag"})
+            # Component tags are USED by this template (not defined here);
+            # the defining edge comes from the @Component class on the .ts side.
+            relation = "uses" if entity_type == "component" else "defines"
+            relations.append({"from": rel_path, "relation": relation, "to": tag_norm})
 
         for class_block in re.findall(r'class(?:Name)?\s*=\s*["\']([^"\']+)["\']', code):
             for cls in re.split(r"\s+", class_block.strip()):
@@ -909,6 +936,52 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return out
 
     @staticmethod
+    def _angular_component_metadata(code: str, suffix: str) -> list[dict]:
+        """Return template-related links emitted by ``@Component({...})``.
+
+        For each decorator block we extract:
+          * ``selector`` string  → defines edge: ``Class defines 'app-foo'``
+            (template extractor emits matching ``uses`` edges from .html files)
+          * ``templateUrl`` path → uses edge:  ``Class uses ./foo.html``
+          * each ``styleUrls`` path → uses edge: ``Class uses ./foo.scss``
+
+        Each entry has shape ``{"class": str, "kind": "selector"|"template"|"style", "value": str}``.
+        """
+        if suffix not in {".ts", ".js"}:
+            return []
+        out: list[dict] = []
+        for m in re.finditer(r"@(Component|Directive)\s*\(\s*\{", code):
+            start = m.end()
+            depth = 1
+            i = start
+            while i < len(code) and depth > 0:
+                c = code[i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                i += 1
+            if depth != 0:
+                continue
+            body = code[start : i - 1]
+            rest = code[i : i + 4000]
+            m_cls = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", rest)
+            if not m_cls:
+                continue
+            owner = m_cls.group(1)
+            m_sel = re.search(r"selector\s*:\s*['\"]([^'\"]+)['\"]", body)
+            if m_sel:
+                out.append({"class": owner, "kind": "selector", "value": m_sel.group(1).strip()})
+            m_tpl = re.search(r"templateUrl\s*:\s*['\"]([^'\"]+)['\"]", body)
+            if m_tpl:
+                out.append({"class": owner, "kind": "template", "value": m_tpl.group(1).strip()})
+            m_styles = re.search(r"styleUrls?\s*:\s*\[([^\]]*)\]", body)
+            if m_styles:
+                for m_p in re.finditer(r"['\"]([^'\"]+)['\"]", m_styles.group(1)):
+                    out.append({"class": owner, "kind": "style", "value": m_p.group(1).strip()})
+        return out
+
+    @staticmethod
     def _module_metadata_dependencies(code: str, suffix: str) -> list[tuple[str, str]]:
         """Return [(module_class, identifier), ...] from ``@NgModule``/``@Module`` arrays.
 
@@ -1025,6 +1098,48 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             if key not in seen_relations:
                 seen_relations.add(key)
                 relations.append({"from": owner, "relation": "uses", "to": dep})
+
+        # @Component({selector, templateUrl, styleUrls}) — link the class to
+        # its template tag, html file, and stylesheet so graph_find_usages
+        # of either side surfaces the other.
+        parent_dir = Path(rel_path).parent.as_posix()
+        for link in self._angular_component_metadata(code, suffix):
+            owner = link["class"]
+            value = link["value"]
+            kind = link["kind"]
+            if kind == "selector":
+                if value not in seen_entities:
+                    seen_entities.add(value)
+                    entities.append({
+                        "name": value,
+                        "type": "selector",
+                        "description": "Angular component selector",
+                    })
+                key = (owner, "defines", value)
+                if key not in seen_relations:
+                    seen_relations.add(key)
+                    relations.append({"from": owner, "relation": "defines", "to": value})
+            else:
+                # Resolve relative paths against the .ts file's directory so
+                # the target matches whatever the .html / .scss extractor stored.
+                resolved = value
+                if value.startswith("./") or value.startswith("../") or not value.startswith("/"):
+                    try:
+                        resolved = (Path(parent_dir) / value).as_posix()
+                    except Exception:
+                        resolved = value
+                resolved = resolved.lstrip("./")
+                if resolved not in seen_entities:
+                    seen_entities.add(resolved)
+                    entities.append({
+                        "name": resolved,
+                        "type": "template" if kind == "template" else "style",
+                        "description": f"Angular {kind} reference",
+                    })
+                key = (owner, "uses", resolved)
+                if key not in seen_relations:
+                    seen_relations.add(key)
+                    relations.append({"from": owner, "relation": "uses", "to": resolved})
 
         return {"entities": entities, "relations": relations}
 
