@@ -231,6 +231,18 @@ def _build_tools() -> list[Tool]:
                     "entity_name": {"type": "string"},
                     "depth": {"type": "integer", "default": 2, "minimum": 1, "maximum": 4},
                     "per_node_cap": {"type": "integer", "default": 50, "minimum": 5, "maximum": 500},
+                    "max_entities": {
+                        "type": "integer", "default": 50, "minimum": 5, "maximum": 500,
+                        "description": "Cap on entities printed. Defaults are tuned to keep depth=2 outputs under ~20KB; raise if you need more rows.",
+                    },
+                    "max_relations": {
+                        "type": "integer", "default": 60, "minimum": 5, "maximum": 500,
+                        "description": "Cap on relations printed. Surplus is reported as a trailing summary line.",
+                    },
+                    "include_snippets": {
+                        "type": "boolean", "default": False,
+                        "description": "Include code snippets per entity. Off by default — snippets are the dominant size driver.",
+                    },
                 },
                 "required": ["entity_name"],
             },
@@ -995,12 +1007,17 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
     if name == "graph_get_subgraph":
         depth = max(1, min(int(args.get("depth", 2)), 4))
         cap = max(5, min(int(args.get("per_node_cap", 50)), 500))
+        max_entities = max(5, min(int(args.get("max_entities", 50)), 500))
+        max_relations = max(5, min(int(args.get("max_relations", 60)), 500))
+        include_snippets = bool(args.get("include_snippets", False))
         sub = g.get_subgraph(args["entity_name"], depth=depth, per_node_cap=cap)
         if not sub["entities"]:
             return f"No subgraph for {args['entity_name']!r}."
+        ent_total = len(sub["entities"])
+        rel_total = len(sub["relations"])
         lines = [
             f"Subgraph around {args['entity_name']!r} (depth {depth}, per_node_cap {cap}):",
-            f"  Entities: {len(sub['entities'])}, relations: {len(sub['relations'])}",
+            f"  Entities: {ent_total}, relations: {rel_total}",
         ]
         if sub.get("truncated_nodes"):
             lines.append(
@@ -1013,14 +1030,22 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
                 lines.append(f"    - {tn}")
             if len(sub["truncated_nodes"]) > 5:
                 lines.append(f"    … and {len(sub['truncated_nodes']) - 5} more")
-        lines.append("Entities:")
-        for e in sub["entities"]:
-            lines.extend(g.format_entity_result(e))
-        lines.append("Relations:")
-        for rel in sub["relations"][:50]:
+        lines.append(f"Entities (showing {min(max_entities, ent_total)} of {ent_total}):")
+        for e in sub["entities"][:max_entities]:
+            lines.extend(g.format_entity_result(e, include_snippet=include_snippets))
+        if ent_total > max_entities:
+            lines.append(f"  … and {ent_total - max_entities} more entities")
+        lines.append(f"Relations (showing {min(max_relations, rel_total)} of {rel_total}):")
+        for rel in sub["relations"][:max_relations]:
             lines.append(f"  • {rel['from']} --{rel['relation']}--> {rel['to']}")
-        if len(sub["relations"]) > 50:
-            lines.append(f"  … and {len(sub['relations']) - 50} more")
+        if rel_total > max_relations:
+            lines.append(f"  … and {rel_total - max_relations} more relations")
+        if sub.get("skipped_hubs"):
+            lines.append(
+                f"Skipped hub names (not expanded — name appears in 10+ files):"
+            )
+            for sh in sub["skipped_hubs"][:10]:
+                lines.append(f"  • {sh}")
         return "\n".join(lines)
 
     if name == "graph_stats":
