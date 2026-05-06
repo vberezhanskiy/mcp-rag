@@ -1855,6 +1855,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         entity_name: str,
         depth: int = 2,
         per_node_cap: int = 50,
+        hub_fanout_threshold: int = 10,
     ) -> dict:
         """BFS expansion around an entity.
 
@@ -1863,16 +1864,35 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         contributes a separate node by lexical name. To keep results usable we
         cap how many relations we walk through *per BFS node* — the rest are
         counted as ``truncated_at`` so the caller sees the partial-result flag.
+
+        BFS walks by *name* (since relations only store names, not entity
+        ids). Names defined in 10+ files (``log``, ``useEffect``, ``FC``)
+        would otherwise pull in unrelated neighborhoods on the next hop —
+        we stop expanding through them at ``cur_depth >= 1`` while still
+        recording the relation so the caller sees the connection.
         """
         visited: set[str] = set()
         seen_rels: set = set()
         all_relations: list = []
         truncated_nodes: list[str] = []
+        skipped_hubs: list[str] = []
         queue: list[tuple[str, int]] = [(entity_name, 0)]
         with sqlite3.connect(self.db_path) as con:
+            # Pre-compute file-fanout per name so we can recognize hubs in O(1)
+            # during BFS instead of running a count query per neighbor.
+            name_fanout = dict(con.execute(
+                "SELECT name, COUNT(DISTINCT file) FROM entities GROUP BY name"
+            ).fetchall())
             while queue:
                 current, cur_depth = queue.pop(0)
                 if current in visited or cur_depth > depth:
+                    continue
+                # Stop expanding through hubs after the first hop. The anchor
+                # itself (cur_depth == 0) is always expanded — user explicitly
+                # asked about it — but neighbor hubs are too noisy to follow.
+                if cur_depth > 0 and name_fanout.get(current, 0) >= hub_fanout_threshold:
+                    visited.add(current)
+                    skipped_hubs.append(f"{current} ({name_fanout[current]} files)")
                     continue
                 visited.add(current)
                 # Probe count first to surface truncation in the result.
@@ -1917,6 +1937,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             "entities": entities,
             "relations": all_relations,
             "truncated_nodes": truncated_nodes,
+            "skipped_hubs": skipped_hubs,
         }
 
     def get_stats(self) -> dict:

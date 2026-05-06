@@ -110,7 +110,14 @@ class GraphTextMixin:
             }
 
         safe_runs = [run.replace('"', '""') for run in literal_runs[:6]]
-        fts_expr = " ".join(f'"{run}"' for run in safe_runs)
+        # FTS5: space = implicit AND. Patterns with top-level alternation
+        # (``TODO|FIXME|XXX``) need OR — otherwise we'd require every literal
+        # run to coexist in the same chunk, which is almost never the case
+        # for alternation. We don't have a real regex parser, but a literal
+        # ``|`` in the pattern is a strong-enough signal: switch to OR and
+        # let Python ``re.finditer`` do the precise filtering after.
+        joiner = " OR " if "|" in pattern else " "
+        fts_expr = joiner.join(f'"{run}"' for run in safe_runs)
 
         flags = re.IGNORECASE if case_insensitive else 0
         try:
