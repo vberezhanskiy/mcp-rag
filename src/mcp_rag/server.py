@@ -140,10 +140,12 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_search",
             description=(
-                "Find entities by NAME (substring/multi-token match on the "
-                "entities table) with optional type filter. Returns a typed "
-                "list of declarations — classes, functions, methods, "
-                "components, etc. — that contain the query in their name. "
+                "Find entities by NAME with optional type filter. Tokenizer "
+                "splits CamelCase / snake_case so 'UserService' finds "
+                "'user_service' and 'renderFn' finds 'render_fn'. Multi-word "
+                "queries OR-match: 'Layout Sider Header' returns rows hitting "
+                "any token, ranked by hit count. Returns typed declarations — "
+                "classes, functions, methods, components, etc.\n\n"
                 "Niche: 'list all classes with Button in the name', "
                 "'every use* hook', 'all *Provider components'.\n\n"
                 "NOT for concept search — descriptive queries like "
@@ -217,13 +219,17 @@ def _build_tools() -> list[Tool]:
             description=(
                 "BFS the relation graph around an entity, up to the given "
                 "depth. Returns reached entities + edges between them. "
-                "Each node's relations are capped (per_node_cap, default 50) "
-                "and overflowed nodes are listed under truncated_nodes so "
-                "the caller knows the result is partial.\n\n"
-                "Reliable on uniquely-named entities only. Common names "
-                "(Layout, Header, props, value) recur as `to_name` across "
-                "hundreds of files and produce mostly truncated_nodes — "
-                "use graph_find_usages for those instead."
+                "Each node's relations are capped (per_node_cap, default 50); "
+                "overflowed nodes are listed under truncated_nodes.\n\n"
+                "Hub names defined in 10+ files (`useEffect`, `log`, `FC`) "
+                "are NOT expanded after the first hop — they're listed under "
+                "skipped_hubs instead. The anchor itself is always expanded.\n\n"
+                "Sane defaults keep depth=2 outputs around 20KB by capping "
+                "rendered entities (max_entities=50) and dropping snippets "
+                "(include_snippets=false). For uniquely-named anchors, "
+                "depth=2 is fine; for popular anchors prefer depth=1.\n\n"
+                "Use graph_find_usages instead when you only need callers, "
+                "not the full neighborhood."
             ),
             inputSchema={
                 "type": "object",
@@ -427,8 +433,11 @@ def _build_tools() -> list[Tool]:
                 "post-match.\n\n"
                 "Pre-filter requires at least one literal alphanumeric "
                 "run of 3+ chars in the pattern (e.g. `def\\s+test_\\w+`, "
-                "`epcp-flex`, `TODO|FIXME`). Pure meta-character patterns "
-                "are rejected to avoid full-scan degeneration.\n\n"
+                "`epcp-flex`, `TODO|FIXME`). Patterns with top-level "
+                "alternation (``|``) join their literal runs with OR for "
+                "the prefilter; everything else uses AND. Pure "
+                "meta-character patterns are rejected to avoid full-scan "
+                "degeneration.\n\n"
                 "Complements search_code (semantic) and "
                 "graph_structural_search (AST). Use when you need raw "
                 "byte-level pattern matching — short literals where "
@@ -441,7 +450,7 @@ def _build_tools() -> list[Tool]:
                     "pattern": {"type": "string", "description": "Python regex pattern."},
                     "file_glob": {
                         "type": "string",
-                        "description": "Optional substring filter on result file paths.",
+                        "description": "Optional path filter — accepts a glob (`*.ts`, `src/**/*.py`) when it contains `* ? [` chars, otherwise treated as a plain substring (`components/Button`).",
                     },
                     "case_insensitive": {"type": "boolean", "default": False},
                     "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
@@ -541,6 +550,10 @@ def _build_tools() -> list[Tool]:
                 "inherits). Optional focus_files / focus_entities bias "
                 "the ranking toward areas you're working on (10× and "
                 "50× respectively).\n\n"
+                "Phantom entities (referenced-only names like ReactNode, "
+                "dayjs, JSX tags from third-party libs) are excluded; "
+                "edges to ambiguous names that appear in 10+ files are "
+                "skipped from ranking so re-exports don't dominate.\n\n"
                 "Use case: load the most relevant N tokens of project "
                 "context into an LLM at session start. Beats blind "
                 "file listing because the ranking reflects actual call "
