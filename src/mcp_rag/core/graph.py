@@ -1787,17 +1787,20 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 )
                 score_params = [f"%{t}%" for t in tokens]
                 exact_q = query.lower()
-                params: list = [
-                    *like_params,
-                    *score_params,
-                    exact_q,
-                    f"{exact_q}%",
-                ]
+                # SQLite binds ``?`` placeholders by position in the query
+                # string, so the params list MUST follow the same order:
+                #   1. score_terms in SELECT
+                #   2. like_clauses in WHERE
+                #   3. AND type = ? (when filtering)
+                #   4. ORDER BY exact-match CASE
+                #   5. ORDER BY prefix-match CASE
+                #   6. LIMIT
+                params: list = [*score_params, *like_params]
                 where_type = ""
                 if entity_type:
                     where_type = " AND type = ?"
                     params.append(entity_type)
-                params.append(limit * 3)
+                params.extend([exact_q, f"{exact_q}%", limit * 3])
 
                 sql = (
                     f"SELECT file, name, type, description, line_start, line_end, snippet, "
