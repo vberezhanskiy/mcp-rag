@@ -105,13 +105,27 @@ class OpenAICompatExtractor:
         return headers
 
     async def extract(self, rel_path: str, code: str) -> dict:
+        truncated = code[:8000] + ("\n... [truncated]" if len(code) > 8000 else "")
+        prompt = _EXTRACT_PROMPT.format(filepath=rel_path, code=truncated)
+        try:
+            text = await self.complete(prompt, max_tokens=2048, temperature=0)
+        except Exception as e:
+            logger.warning("LLM extract failed for %s: %s", rel_path, e)
+            return {"entities": [], "relations": []}
+        if not text:
+            return {"entities": [], "relations": []}
+        return _parse_json_lenient(_strip_code_fence(text))
+
+    async def complete(self, prompt: str, max_tokens: int = 400, temperature: float = 0.0) -> str:
+        """Generic chat-completion. Returns the assistant's text or '' on failure.
+
+        Used by ``extract()`` and by host features that want a one-shot LLM
+        call without its own client (e.g. HyDE query expansion in search_code).
+        """
         try:
             import httpx
         except ImportError as e:
             raise RuntimeError("httpx not installed — install with `pip install mcp-rag[llm]`") from e
-
-        truncated = code[:8000] + ("\n... [truncated]" if len(code) > 8000 else "")
-        prompt = _EXTRACT_PROMPT.format(filepath=rel_path, code=truncated)
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -121,20 +135,18 @@ class OpenAICompatExtractor:
                     json={
                         "model": self.model,
                         "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0,
-                        "max_tokens": 2048,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
                         "stream": False,
                     },
                 )
             if resp.status_code != 200:
-                logger.error("LLM extract HTTP %s for %s", resp.status_code, rel_path)
-                return {"entities": [], "relations": []}
-            text = resp.json()["choices"][0]["message"]["content"].strip()
-            text = _strip_code_fence(text)
-            return _parse_json_lenient(text)
+                logger.error("LLM complete HTTP %s: %s", resp.status_code, resp.text[:300])
+                return ""
+            return resp.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
-            logger.warning("LLM extract failed for %s: %s", rel_path, e)
-            return {"entities": [], "relations": []}
+            logger.warning("LLM complete failed: %s", e)
+            return ""
 
 
 def _strip_code_fence(text: str) -> str:

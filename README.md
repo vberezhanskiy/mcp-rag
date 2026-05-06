@@ -63,6 +63,8 @@ search_code "auth flow"   # concept search across code text
 graph_find_usages User    # exact-name refactor scope
 graph_find_clones         # surface near-duplicate implementations
 graph_test_coverage       # which production defs have tests
+graph_repo_map            # PageRank-ranked project skeleton
+graph_structural_search 'fetch($URL)' --lang typescript
 graph_visualize           # writes HTML, open in browser
 ```
 
@@ -77,6 +79,9 @@ rag> search auth flow
 rag> usages LoginForm
 rag> clones
 rag> coverage
+rag> repomap
+rag> struct fetch($URL)
+rag> contexts
 rag> quit
 ```
 
@@ -244,6 +249,8 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
 | `graph_find_similar` | Semantically nearest entities to an anchor — dedup detection. The embed text combines `name + outgoing relations + snippet`, so structural fingerprints cluster (all antd-component wrappers end up close). |
 | `graph_find_clones` | Detect clusters of near-duplicate definitions — pairs flagged when FAISS similarity AND outgoing-relation Jaccard overlap both pass thresholds. Catches copy-pasted helpers, parallel auth flows, repeated validation. |
 | `graph_test_coverage` | Reverse-traverses the graph from test files (heuristic-detected: `test_*.py`, `*.test.tsx`, `*_test.go`, …) to surface uncovered production defs. Modes: `summary`, `uncovered`, `entity`. |
+| `graph_repo_map` | Token-budgeted Markdown skeleton of the most-important code, ranked by personalized PageRank. Optional `focus_files` / `focus_entities` bias the ranking. Hand to an LLM at session start instead of a blind file listing. |
+| `graph_structural_search` | AST-precise pattern search via [ast-grep](https://ast-grep.github.io/). Use metavariables: `fetch($URL)` matches every fetch call. Requires `ast-grep` (or `sg`) on PATH. |
 | `graph_dead_code` | Functions/classes/components no relation points at. Pass `exclude_paths` globs to skip scaffolding. |
 | `graph_get_subgraph` | BFS the relation graph around an entity. Capped per node — common names like `Layout`/`Header` produce mostly truncated nodes; reliable on uniquely-named entities. |
 | `graph_visualize` | Renders an interactive HTML page with three drill-down levels (modules → files → entities). Self-contained, vis-network from CDN. |
@@ -261,6 +268,16 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
 | Tool | What it does |
 |---|---|
 | `memory_add` / `memory_search` / `memory_list` / `memory_delete` / `memory_clear` | Per-project memory store, indexed for hybrid search. Useful for hosts without their own memory layer. |
+
+### Context bundles
+
+| Tool | What it does |
+|---|---|
+| `context_save` / `context_load` / `context_list` / `context_delete` | Named retrieval-context bundles — pin files + entities + notes under one handle (`auth-refactor`) and reload across sessions. JSON-on-disk at `<project_dir>/contexts/`. Inspired by Copilot Spaces / Cline Memory Bank. |
+
+### `search_code` extras
+
+`search_code` accepts an optional `hyde: true` flag. When set AND an LLM is configured (`MCP_RAG_LLM_*` env), the query is first passed through the LLM to draft a hypothetical code snippet; that snippet is appended before BM25/dense retrieval to bridge the question-vs-code embedding gap (Continue-style HyDE).
 
 ---
 

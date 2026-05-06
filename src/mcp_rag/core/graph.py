@@ -1764,6 +1764,259 @@ class CodeGraph:
             "by_type": dict(by_type),
         }
 
+    _ASTGREP_LANG_FROM_EXT = {
+        ".py": "python", ".js": "javascript", ".jsx": "javascript",
+        ".ts": "typescript", ".tsx": "tsx", ".go": "go", ".rs": "rust",
+        ".java": "java", ".c": "c", ".cpp": "cpp", ".cc": "cpp",
+        ".h": "c", ".hpp": "cpp", ".rb": "ruby", ".php": "php",
+        ".cs": "c_sharp", ".kt": "kotlin", ".swift": "swift", ".scala": "scala",
+        ".lua": "lua", ".html": "html", ".css": "css", ".json": "json",
+        ".yaml": "yaml", ".yml": "yaml",
+    }
+
+    def structural_search(
+        self,
+        pattern: str,
+        lang: Optional[str] = None,
+        path_filter: Optional[str] = None,
+        limit: int = 50,
+    ) -> dict:
+        """AST-precise structural search via the ast-grep CLI.
+
+        Patterns use metavariables: ``fetch($URL)`` matches all `fetch()`
+        calls regardless of argument shape; ``$X.then($CB)`` finds every
+        promise-then chain. AST-aware — won't match strings or comments.
+
+        Returns matches with file/line/code. Requires ``ast-grep`` (or
+        ``sg``) on PATH; install via ``cargo install ast-grep`` or
+        ``brew install ast-grep``.
+
+        ``lang`` is auto-detected from path_filter when omitted; if no
+        filter is given and no lang is set, ast-grep tries every language.
+        """
+        import shutil
+        import subprocess
+
+        binary = shutil.which("ast-grep") or shutil.which("sg")
+        if not binary:
+            return {
+                "matches": [],
+                "warning": (
+                    "ast-grep not found on PATH. Install via "
+                    "`cargo install ast-grep` or `brew install ast-grep` "
+                    "(also called `sg`)."
+                ),
+            }
+
+        cmd = [binary, "--pattern", pattern, "--json=stream"]
+        if lang:
+            cmd.extend(["--lang", lang])
+        target = self.project_root
+        if path_filter:
+            target = self.project_root / path_filter
+            if not target.exists():
+                return {"matches": [], "warning": f"path_filter not found: {path_filter}"}
+        cmd.append(str(target))
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
+            )
+        except subprocess.TimeoutExpired:
+            return {"matches": [], "warning": "ast-grep timed out (>60s)"}
+        except Exception as e:
+            return {"matches": [], "warning": f"ast-grep failed: {e}"}
+
+        if proc.returncode not in (0, 1):  # 1 = no matches in some versions
+            return {
+                "matches": [],
+                "warning": f"ast-grep exited {proc.returncode}: {proc.stderr.strip()[:300]}",
+            }
+
+        matches: list[dict] = []
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            file_path = rec.get("file") or ""
+            try:
+                rel = Path(file_path).resolve().relative_to(self.project_root).as_posix()
+            except (ValueError, OSError):
+                rel = file_path
+            r = rec.get("range") or {}
+            start = (r.get("start") or {}).get("line", 0) + 1
+            end = (r.get("end") or {}).get("line", 0) + 1
+            matches.append({
+                "file": rel,
+                "line_start": start,
+                "line_end": end,
+                "code": (rec.get("text") or "")[:300],
+            })
+            if len(matches) >= limit:
+                break
+
+        return {"matches": matches, "warning": None, "binary": binary}
+
+    def build_repo_map(
+        self,
+        token_budget: int = 8000,
+        focus_files: Optional[list[str]] = None,
+        focus_entities: Optional[list[str]] = None,
+        chars_per_token: int = 4,
+    ) -> dict:
+        """Token-budgeted skeleton of the most-important code in the project.
+
+        Inspired by Aider's repo-map: runs personalized PageRank over the
+        relation graph, biased toward ``focus_files`` (10×) and
+        ``focus_entities`` (50×) when provided. The top-scoring entities
+        are formatted into a compact Markdown skeleton (signature lines,
+        elided bodies) that fits inside ``token_budget`` characters / 4.
+
+        Use case: hand an LLM the project's "most-important N tokens"
+        without enumerating every file. Beats blind file listing because
+        the ranking reflects actual call/import topology.
+        """
+        try:
+            import networkx as nx
+        except ImportError:
+            return {
+                "markdown": "",
+                "warning": "networkx not installed — `pip install networkx` to enable graph_repo_map.",
+                "selected_count": 0,
+            }
+
+        with sqlite3.connect(self.db_path) as con:
+            ent_rows = con.execute(
+                "SELECT file, name, type, line_start, line_end, snippet, description "
+                "FROM entities "
+                "WHERE type IN ('class','function','method','component','interface','module','enum')"
+            ).fetchall()
+            rel_rows = con.execute(
+                "SELECT file, from_name, relation, to_name FROM relations "
+                "WHERE relation IN ('calls','uses','instantiates','inherits','imports')"
+            ).fetchall()
+
+        if not ent_rows:
+            return {"markdown": "", "warning": "Graph is empty — run graph_build first.", "selected_count": 0}
+
+        # Node = (file, name). Edge weight = relation count.
+        graph = nx.DiGraph()
+        ent_by_key: dict[tuple[str, str], dict] = {}
+        for f, n, t, ls, le, sn, desc in ent_rows:
+            key = (f, n)
+            ent_by_key[key] = {
+                "file": f, "name": n, "type": t,
+                "line_start": ls, "line_end": le,
+                "snippet": sn or "", "description": desc or "",
+            }
+            graph.add_node(key)
+
+        # Map name -> list of files defining it (used to resolve relation targets).
+        name_to_files: dict[str, list[str]] = {}
+        for (f, n) in ent_by_key:
+            name_to_files.setdefault(n, []).append(f)
+
+        for src_file, src_name, _rel, dst_name in rel_rows:
+            src_key = (src_file, src_name)
+            if src_key not in ent_by_key:
+                continue
+            # Resolve target: same-file def first, else any file defining the name.
+            target_files = name_to_files.get(dst_name) or []
+            if src_file in target_files:
+                dst_key = (src_file, dst_name)
+            elif target_files:
+                dst_key = (target_files[0], dst_name)
+            else:
+                continue
+            if dst_key == src_key:
+                continue
+            if graph.has_edge(src_key, dst_key):
+                graph[src_key][dst_key]["weight"] += 1.0
+            else:
+                graph.add_edge(src_key, dst_key, weight=1.0)
+
+        # Personalized teleport vector — bias toward focus.
+        focus_files_norm = {f.replace("\\", "/") for f in (focus_files or [])}
+        focus_entity_set = set(focus_entities or [])
+        personalization: dict[tuple[str, str], float] = {}
+        for key in graph.nodes:
+            f, n = key
+            weight = 1.0
+            if focus_files_norm and any(ff in f.replace("\\", "/") for ff in focus_files_norm):
+                weight += 10.0
+            if n in focus_entity_set:
+                weight += 50.0
+            personalization[key] = weight
+
+        try:
+            scores = nx.pagerank(graph, alpha=0.85, personalization=personalization, max_iter=100)
+        except Exception as e:
+            # Disconnected components / convergence failure — fall back to in-degree.
+            logger.warning("PageRank failed (%s); falling back to in-degree.", e)
+            scores = {k: float(graph.in_degree(k, weight="weight")) for k in graph.nodes}
+
+        # Group selected entities by file. Greedy: pick highest-scored until budget.
+        budget_chars = max(1000, token_budget * chars_per_token)
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+
+        selected_by_file: dict[str, list[dict]] = {}
+        used = 0
+        selected_count = 0
+        for key, _score in ranked:
+            ent = ent_by_key[key]
+            line = self._repo_map_line(ent)
+            cost = len(line) + 2
+            if used + cost > budget_chars:
+                continue
+            selected_by_file.setdefault(ent["file"], []).append(ent)
+            used += cost
+            selected_count += 1
+            if used >= budget_chars * 0.95:
+                break
+
+        # Render markdown grouped by file, files ordered by best-ranked entity.
+        file_best_score = {
+            f: max(scores.get((e["file"], e["name"]), 0.0) for e in entries)
+            for f, entries in selected_by_file.items()
+        }
+        ordered_files = sorted(selected_by_file, key=lambda f: file_best_score[f], reverse=True)
+
+        out_lines = [f"# Repo map ({selected_count} entities, ~{used // chars_per_token} tokens)"]
+        if focus_files_norm or focus_entity_set:
+            bits = []
+            if focus_files_norm:
+                bits.append(f"focus_files={sorted(focus_files_norm)}")
+            if focus_entity_set:
+                bits.append(f"focus_entities={sorted(focus_entity_set)}")
+            out_lines.append(f"_Personalized: {', '.join(bits)}_")
+        for f in ordered_files:
+            out_lines.append(f"\n## `{f}`")
+            for ent in sorted(selected_by_file[f], key=lambda e: e.get("line_start") or 0):
+                out_lines.append("  " + self._repo_map_line(ent))
+
+        return {
+            "markdown": "\n".join(out_lines),
+            "warning": None,
+            "selected_count": selected_count,
+            "approx_tokens": used // chars_per_token,
+        }
+
+    @staticmethod
+    def _repo_map_line(ent: dict) -> str:
+        """Render one entity as a one-liner skeleton (type, name, location)."""
+        loc = f":{ent['line_start']}" if ent.get("line_start") else ""
+        snippet = (ent.get("snippet") or "").strip().splitlines()[0] if ent.get("snippet") else ""
+        snippet = snippet[:120] + ("…" if len(snippet) > 120 else "")
+        if snippet:
+            return f"- [{ent['type']}] **{ent['name']}**{loc} — `{snippet}`"
+        desc = (ent.get("description") or "").strip()[:80]
+        return f"- [{ent['type']}] **{ent['name']}**{loc}" + (f" — {desc}" if desc else "")
+
     def explain_file(self, rel_path: str, top_callers: int = 5) -> dict:
         """One-shot view of a file: defined entities, deps, and who uses them."""
         defined = self.get_file_entities(rel_path)

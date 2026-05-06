@@ -23,6 +23,7 @@ from pydantic import AnyUrl
 
 from .config import Config
 from .core import embedder
+from .core.context import ContextStore
 from .core.formatter import format_memory_listing
 from .core.graph import CodeGraph
 from .core.memory import Memory, MemorySystem
@@ -41,6 +42,7 @@ class Services:
         self._graph: Optional[CodeGraph] = None
         self._retriever: Optional[MultiLangCodeRetriever] = None
         self._memory: Optional[MemorySystem] = None
+        self._contexts: Optional[ContextStore] = None
         # Background graph_build task — kept alive on the Services object so
         # asyncio doesn't GC it while it runs.
         self._build_task: Optional[asyncio.Task] = None
@@ -70,6 +72,12 @@ class Services:
         if self._memory is None:
             self._memory = MemorySystem(memory_dir=self.config.memory_dir)
         return self._memory
+
+    @property
+    def contexts(self) -> ContextStore:
+        if not hasattr(self, "_contexts") or self._contexts is None:
+            self._contexts = ContextStore(self.config.project_dir)
+        return self._contexts
 
 
 def _memory_disabled() -> bool:
@@ -382,6 +390,73 @@ def _build_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
+            name="graph_structural_search",
+            description=(
+                "AST-precise structural search via ast-grep. Patterns "
+                "use metavariables — ``fetch($URL)`` matches every fetch "
+                "call regardless of argument shape; ``$X.then($CB)`` "
+                "finds every promise-then chain.\n\n"
+                "Complements text search (BM25/dense miss structural "
+                "shape) and entity search (graph_search/find_usages need "
+                "exact names). Requires ast-grep (or `sg`) on PATH; "
+                "install via `cargo install ast-grep` or `brew install "
+                "ast-grep`.\n\n"
+                "Use case: refactor candidates ('every direct fetch "
+                "call'), pattern-based audits ('every empty catch "
+                "block'), structural codemod scoping."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "ast-grep pattern with $VARS metavariables.",
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "Language hint (python, javascript, typescript, tsx, go, rust, java, c, cpp, ruby, php, c_sharp, kotlin, swift, html, css, json, yaml). Auto-skipped when omitted — ast-grep will try several.",
+                    },
+                    "path_filter": {
+                        "type": "string",
+                        "description": "Optional sub-path under the project root to restrict the search (e.g. 'src/components').",
+                    },
+                    "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 500},
+                },
+                "required": ["pattern"],
+            },
+        ),
+        Tool(
+            name="graph_repo_map",
+            description=(
+                "Token-budgeted skeleton of the most-important code in "
+                "the project, ranked by personalized PageRank over the "
+                "relation graph (calls/uses/imports/instantiates/"
+                "inherits). Optional focus_files / focus_entities bias "
+                "the ranking toward areas you're working on (10× and "
+                "50× respectively).\n\n"
+                "Use case: load the most relevant N tokens of project "
+                "context into an LLM at session start. Beats blind "
+                "file listing because the ranking reflects actual call "
+                "topology — central abstractions surface first."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "token_budget": {"type": "integer", "default": 8000, "minimum": 500, "maximum": 60000},
+                    "focus_files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Substrings of file paths to bias toward (e.g. ['src/auth', 'routes']).",
+                    },
+                    "focus_entities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact entity names to bias toward (50× weight on personalization vector).",
+                    },
+                },
+            },
+        ),
+        Tool(
             name="graph_test_coverage",
             description=(
                 "Map production entities to the test files that exercise "
@@ -490,8 +565,68 @@ def _build_tools() -> list[Tool]:
                     "query": {"type": "string"},
                     "top_k": {"type": "integer", "default": 8, "minimum": 1, "maximum": 30},
                     "max_chunk_chars": {"type": "integer", "default": 1500},
+                    "hyde": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and an LLM is configured (MCP_RAG_LLM_*), draft a hypothetical code snippet from the query first and append it before retrieval. Bridges the question-vs-code embedding gap for natural-language queries.",
+                    },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="context_save",
+            description=(
+                "Save a named retrieval-context bundle for this project: "
+                "the curated set of files / entities / notes you're "
+                "actively working with. Persists to "
+                "<project_dir>/contexts/<name>.json so the same handle "
+                "can be reloaded across sessions or shared via git.\n\n"
+                "Use case: 'auth-refactor' — pin the auth module files, "
+                "the entities being renamed, and a note about the JWT "
+                "migration plan; pull the bundle back at the start of "
+                "the next session via context_load."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Bundle name. 1-64 chars of [A-Za-z0-9_-], starting with letter/digit.",
+                    },
+                    "query": {"type": "string", "description": "Optional query/topic that scoped this bundle."},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Project-relative file paths."},
+                    "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names central to this context."},
+                    "notes": {"type": "string", "description": "Free-form notes (decisions, TODOs, gotchas)."},
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="context_load",
+            description=(
+                "Load a saved context bundle by name. Returns query + "
+                "files + entities + notes so a fresh agent session can "
+                "rehydrate the prior working set in one call."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="context_list",
+            description="List every saved context bundle for this project (name, saved_at, file/entity counts, query preview).",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="context_delete",
+            description="Delete a saved context bundle by name. Returns whether anything was removed.",
+            inputSchema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
             },
         ),
         Tool(
@@ -593,6 +728,7 @@ _GRAPH_TOOLS_NEEDING_DATA = {
     "graph_find_similar",
     "graph_find_clones",
     "graph_test_coverage",
+    "graph_repo_map",
     "graph_visualize",
 }
 
@@ -929,6 +1065,34 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         )
         return "\n".join(lines)
 
+    if name == "graph_structural_search":
+        out = g.structural_search(
+            pattern=str(args.get("pattern") or "").strip(),
+            lang=args.get("lang") or None,
+            path_filter=args.get("path_filter") or None,
+            limit=int(args.get("limit", 50)),
+        )
+        if out.get("warning"):
+            return out["warning"]
+        matches = out["matches"]
+        if not matches:
+            return f"No matches for pattern: {args.get('pattern')!r}"
+        lines = [f"{len(matches)} structural match(es) for pattern {args.get('pattern')!r}:"]
+        for m in matches:
+            lines.append(f"  • {m['file']}:{m['line_start']}-{m['line_end']}")
+            lines.append(f"      {m['code'][:200]}")
+        return "\n".join(lines)
+
+    if name == "graph_repo_map":
+        out = g.build_repo_map(
+            token_budget=int(args.get("token_budget", 8000)),
+            focus_files=args.get("focus_files") or None,
+            focus_entities=args.get("focus_entities") or None,
+        )
+        if out.get("warning"):
+            return out["warning"]
+        return out["markdown"] or "Repo map empty — graph has no rankable entities yet."
+
     if name == "graph_test_coverage":
         mode = (args.get("mode") or "summary").strip()
         out = g.find_test_coverage(
@@ -1031,12 +1195,84 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
     if name == "search_code":
         top_k = max(1, min(int(args.get("top_k", 8)), 30))
         max_chunk = max(100, min(int(args.get("max_chunk_chars", 1500)), 5000))
+        query = args["query"]
+        hyde = bool(args.get("hyde"))
+        if hyde and isinstance(services.llm_extractor, OpenAICompatExtractor):
+            hyde_prompt = (
+                "You are helping search a codebase. Given the user's question, "
+                "write a SHORT hypothetical code snippet (function signature + "
+                "3-7 lines of body) that, if it existed, would best answer the "
+                "question. Return ONLY the code, no commentary, no explanation, "
+                "no markdown fences.\n\n"
+                f"Question: {query}"
+            )
+            try:
+                hypo = await services.llm_extractor.complete(hyde_prompt, max_tokens=300)
+            except Exception as e:
+                logger.warning("HyDE expansion failed: %s", e)
+                hypo = ""
+            if hypo:
+                query = f"{query}\n\n{hypo}"
         return services.retriever.search(
-            args["query"],
+            query,
             top_k_initial=max(top_k * 4, 30),
             top_k_final=top_k,
             max_chunk_preview=max_chunk,
         )
+
+    if name == "context_save":
+        try:
+            payload = services.contexts.save(
+                name=str(args.get("name") or "").strip(),
+                query=args.get("query"),
+                files=args.get("files") or [],
+                entities=args.get("entities") or [],
+                notes=args.get("notes"),
+            )
+        except ValueError as e:
+            return f"❌ {e}"
+        return (
+            f"✅ Saved context {payload['name']!r}: "
+            f"{len(payload['files'])} file(s), {len(payload['entities'])} entity(ies)\n"
+            f"   path: {payload['path']}"
+        )
+
+    if name == "context_load":
+        data = services.contexts.load(str(args.get("name") or "").strip())
+        if not data:
+            return f"No context named {args.get('name')!r}."
+        lines = [f"# Context: {data['name']}", f"_saved {data.get('saved_at', '?')}_"]
+        if data.get("query"):
+            lines.append(f"\n**Query:** {data['query']}")
+        if data.get("files"):
+            lines.append(f"\n## Files ({len(data['files'])})")
+            for f in data["files"]:
+                lines.append(f"- `{f}`")
+        if data.get("entities"):
+            lines.append(f"\n## Entities ({len(data['entities'])})")
+            for e in data["entities"]:
+                lines.append(f"- {e}")
+        if data.get("notes"):
+            lines.append(f"\n## Notes\n{data['notes']}")
+        return "\n".join(lines)
+
+    if name == "context_list":
+        bundles = services.contexts.list()
+        if not bundles:
+            return "No saved contexts. Use context_save to create one."
+        lines = [f"{len(bundles)} saved context(s):"]
+        for b in bundles:
+            lines.append(
+                f"  • {b['name']} — {b['files']} file(s), {b['entities']} entity(ies)"
+                f"  ({b['saved_at']})"
+            )
+            if b.get("query"):
+                lines.append(f"      query: {b['query']}")
+        return "\n".join(lines)
+
+    if name == "context_delete":
+        ok = services.contexts.delete(str(args.get("name") or "").strip())
+        return f"✅ Deleted context {args.get('name')!r}." if ok else f"No context named {args.get('name')!r}."
 
     if name.startswith("memory_") and _memory_disabled():
         return (
@@ -1342,6 +1578,10 @@ def _repl_kwargs_filepath(rest: str) -> dict:
     return {"filepath": rest.strip()} if rest.strip() else {}
 
 
+def _repl_kwargs_pattern(rest: str) -> dict:
+    return {"pattern": rest.strip()} if rest.strip() else {}
+
+
 def _repl_kwargs_empty(rest: str) -> dict:  # noqa: ARG001
     return {}
 
@@ -1354,6 +1594,9 @@ _REPL_COMMANDS: dict[str, tuple[str, callable, str]] = {
     "similar":  ("graph_find_similar",   _repl_kwargs_entity,   "similar <name>            FAISS-nearest entities"),
     "clones":   ("graph_find_clones",    _repl_kwargs_empty,    "clones                    detect clone clusters"),
     "coverage": ("graph_test_coverage",  _repl_kwargs_empty,    "coverage                  test-coverage summary"),
+    "repomap":  ("graph_repo_map",       _repl_kwargs_empty,    "repomap                   PageRank-ranked project skeleton"),
+    "struct":   ("graph_structural_search", _repl_kwargs_pattern, "struct <pattern>          ast-grep structural search"),
+    "contexts": ("context_list",         _repl_kwargs_empty,    "contexts                  list saved retrieval bundles"),
     "dead":     ("graph_dead_code",      _repl_kwargs_empty,    "dead                      possibly-dead defs"),
     "viz":      ("graph_visualize",      _repl_kwargs_empty,    "viz                       write graph.html, open in browser"),
     "build":    ("graph_build",          _repl_kwargs_empty,    "build                     index/refresh stale files"),
