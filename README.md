@@ -270,7 +270,7 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
 
 | Tool | What it does |
 |---|---|
-| `memory_add` / `memory_search` / `memory_list` / `memory_delete` / `memory_clear` | Per-project memory store, indexed for hybrid search. Useful for hosts without their own memory layer. |
+| `memory_save` / `memory_search` / `memory_list` / `memory_delete` / `memory_clear` | Per-project memory store, indexed for hybrid search. Useful for hosts without their own memory layer. |
 
 ### Context bundles
 

@@ -714,7 +714,7 @@ def _build_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="memory_add",
+            name="memory_save",
             description=(
                 "Persist a fact about this project (decision, convention, "
                 "DTO shape, operational note). Stored per project root, "
@@ -1450,7 +1450,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             "(MCP_RAG_NO_MEMORY=1). Unset the env var to re-enable."
         )
 
-    if name == "memory_add":
+    if name == "memory_save":
         mem = Memory(
             content=args["content"],
             memory_type=args.get("memory_type", "general"),
