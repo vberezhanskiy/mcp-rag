@@ -525,6 +525,18 @@ class GraphAnalysisMixin:
                 "SELECT file, from_name, relation, to_name FROM relations "
                 "WHERE relation IN ('calls','uses','instantiates','inherits','imports')"
             ).fetchall()
+            # File-fanout count per name — ambiguous identifiers (Input, Title,
+            # Text, Typography…) appear in many files and we can't reliably
+            # attribute reference edges to a single definition. PageRank then
+            # over-credits whichever node was picked first. Track counts so the
+            # edge-wiring loop can skip ambiguous targets.
+            name_fanout = dict(
+                con.execute(
+                    "SELECT name, COUNT(DISTINCT file) FROM entities "
+                    "WHERE type IN ('class','function','method','component','interface','module','enum') "
+                    "GROUP BY name"
+                ).fetchall()
+            )
 
         if not ent_rows:
             return {"markdown": "", "warning": "Graph is empty — run graph_build first.", "selected_count": 0}
@@ -544,9 +556,16 @@ class GraphAnalysisMixin:
         for (f, n) in ent_by_key:
             name_to_files.setdefault(n, []).append(f)
 
+        # Ambiguity threshold: names defined in this many files (or more)
+        # in the raw entity table are skipped during edge wiring. Empirically
+        # 10 captures ant/MUI re-exports (Input=32, Typography=141, Text=182)
+        # while keeping legitimately-popular project names (Layout, Header).
+        FANOUT_AMBIGUITY_THRESHOLD = 10
         for src_file, src_name, _rel, dst_name in rel_rows:
             src_key = (src_file, src_name)
             if src_key not in ent_by_key:
+                continue
+            if name_fanout.get(dst_name, 0) >= FANOUT_AMBIGUITY_THRESHOLD:
                 continue
             target_files = name_to_files.get(dst_name) or []
             if src_file in target_files:
