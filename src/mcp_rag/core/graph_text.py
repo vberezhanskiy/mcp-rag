@@ -91,6 +91,10 @@ class GraphTextMixin:
         Required: at least one literal alphanumeric run of 3+ characters
         in the pattern (used as the trigram pre-filter). Patterns of
         only meta-characters are rejected to avoid full-scan degeneration.
+
+        ``file_glob`` accepts either a glob pattern (``*.ts``, ``src/**/*.py``)
+        or a plain substring (``components/Button``); wildcard chars are the
+        signal that triggers fnmatch — anything else falls back to substring.
         """
         self._ensure_text_index()
 
@@ -125,9 +129,16 @@ class GraphTextMixin:
             except sqlite3.OperationalError as e:
                 return {"matches": [], "warning": f"FTS5 MATCH failed: {e}"}
 
+            use_glob = bool(file_glob) and any(c in file_glob for c in "*?[")
             for file_path, line_start, content in cursor:
-                if file_glob and file_glob not in file_path:
-                    continue
+                if file_glob:
+                    if use_glob:
+                        import fnmatch
+                        if not (fnmatch.fnmatchcase(file_path, file_glob)
+                                or fnmatch.fnmatchcase(file_path.replace("\\", "/"), file_glob)):
+                            continue
+                    elif file_glob not in file_path:
+                        continue
                 for m in rx.finditer(content):
                     line_offset = content[:m.start()].count("\n")
                     line_no = (line_start or 0) + line_offset
