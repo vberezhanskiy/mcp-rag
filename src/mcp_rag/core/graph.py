@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 _ALLOWED_ENTITY_TYPES = {
     "class", "function", "method", "import", "module", "interface", "component",
     "hook", "type", "enum", "selector", "style", "template", "config", "variable", "symbol", "property",
+    # Framework-specific (Angular / NestJS / React hooks)
+    "service", "directive", "pipe",
 }
 
 _ALLOWED_RELATION_TYPES = {
@@ -657,7 +659,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     def _infer_tree_sitter_entity_type(node_type: str, name: str, rel_path: str, suffix: str) -> str:
         node_type = (node_type or "").lower()
         is_jsx_file = suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"}
+        is_ts_or_jsx = is_jsx_file or suffix in {".ts", ".js"}
         is_pascal = bool(name) and name[:1].isupper()
+        # React custom hooks: useXxx convention. Detect in any TS/JS-family
+        # file (React hooks frequently live in plain .ts/.js too).
+        is_hook_name = (
+            len(name) > 3 and name.startswith("use") and name[3:4].isupper()
+        )
+        if is_ts_or_jsx and is_hook_name and ("function" in node_type or "variable" in node_type):
+            return "hook"
         # In JSX/TSX files, PascalCase function or class declarations are
         # React components — classify them as such so entity_type='component'
         # filters work the way users expect (Button, Modal, AntdTable, …).
@@ -829,6 +839,32 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     seen_relations.add(rel_key)
                     relations.append({"from": owner, "relation": "uses", "to": symbol})
 
+    @staticmethod
+    def _angular_decorator_overrides(code: str, suffix: str) -> dict[str, str]:
+        """Map ``ClassName -> refined_type`` for Angular/NestJS-decorated classes.
+
+        Tree-sitter's class_declaration node type loses the decorator context,
+        so a quick regex pre-scan is the cheapest way to recover it. Each
+        ``@Decorator`` is followed (after some chars of metadata) by the next
+        ``class Foo`` declaration — that pairing is what we capture.
+        """
+        if suffix not in {".ts", ".js"}:
+            return {}
+        decorator_to_type = {
+            "Component": "component",
+            "Directive": "directive",
+            "Injectable": "service",
+            "NgModule": "module",
+            "Pipe": "pipe",
+        }
+        out: dict[str, str] = {}
+        for m in re.finditer(r"@(Component|Directive|Injectable|NgModule|Pipe)\b", code):
+            tail = code[m.end() : m.end() + 4000]
+            m2 = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", tail)
+            if m2:
+                out[m2.group(1)] = decorator_to_type[m.group(1)]
+        return out
+
     def _extract_with_tree_sitter(self, filepath: Path, code: str) -> dict:
         parser = self._get_tree_sitter_parser(filepath)
         rel_path = filepath.relative_to(self.project_root).as_posix()
@@ -841,6 +877,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return {"entities": [], "relations": []}
 
         suffix = filepath.suffix.lower()
+        ng_overrides = self._angular_decorator_overrides(code, suffix)
         entities = [self._make_file_entity(rel_path, "module", "Source file")]
         relations: list[dict] = []
         seen_entities = {rel_path}
@@ -855,6 +892,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 if name and name not in seen_entities:
                     seen_entities.add(name)
                     entity_type = self._infer_tree_sitter_entity_type(node.type, name, rel_path, suffix)
+                    if entity_type == "class" and name in ng_overrides:
+                        entity_type = ng_overrides[name]
                     entities.append({
                         "name": name,
                         "type": entity_type,
