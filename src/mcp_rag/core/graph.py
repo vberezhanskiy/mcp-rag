@@ -43,40 +43,174 @@ _ALLOWED_RELATION_TYPES = {
 }
 
 _TREE_SITTER_LANGUAGES = {
+    # ── Mainstream ─────────────────────────────────────────────────────
     ".py": "python",
+    ".pyi": "python",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".jsx": "javascript",
     ".ts": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
     ".tsx": "tsx",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".scala": "scala",
+    ".sc": "scala",
     ".go": "go",
     ".rs": "rust",
-    ".java": "java",
+    # NB: `.cs` parser ('csharp') is built against grammar v15 but tree-sitter
+    # 0.23.x ABI only supports v13-v14 — so C# silently falls back to LLM
+    # extraction until language-pack ships a v14 grammar. Keep the entry so
+    # it activates automatically on future pack/tree-sitter upgrades.
+    ".cs": "csharp",
     ".php": "php",
+    ".phtml": "php",
     ".rb": "ruby",
-    ".cs": "c_sharp",
+    ".pl": "perl",
+    ".pm": "perl",
+    # ── Systems / native ───────────────────────────────────────────────
+    ".c": "c",
+    ".h": "c",
     ".cpp": "cpp",
     ".cc": "cpp",
     ".cxx": "cpp",
+    ".c++": "cpp",
     ".hpp": "cpp",
     ".hh": "cpp",
-    ".h": "c",
-    ".c": "c",
+    ".hxx": "cpp",
+    ".m": "objc",
+    ".d": "d",
+    ".zig": "zig",
+    # ── JVM-adjacent ───────────────────────────────────────────────────
+    ".groovy": "groovy",
+    ".gradle": "groovy",
+    ".clj": "clojure",
+    ".cljs": "clojure",
+    ".cljc": "clojure",
+    ".edn": "clojure",
+    # ── Functional ─────────────────────────────────────────────────────
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".erl": "erlang",
+    ".hrl": "erlang",
+    ".hs": "haskell",
+    ".lhs": "haskell",
+    # ── Scripting / dynamic ────────────────────────────────────────────
+    ".lua": "lua",
+    ".jl": "julia",
+    ".r": "r",
+    ".R": "r",
+    ".dart": "dart",
+    # ── Shell ──────────────────────────────────────────────────────────
+    ".sh": "bash",
+    ".bash": "bash",
+    ".zsh": "bash",
+    ".fish": "fish",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
+    # ── Web3 ───────────────────────────────────────────────────────────
+    ".sol": "solidity",
+    # ── Infrastructure as code ─────────────────────────────────────────
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".hcl": "hcl",
+    ".nix": "nix",
+    # ── Data / schema ──────────────────────────────────────────────────
+    # NB: .sql grammar same v15 incompatibility as csharp until pack upgrade.
+    ".sql": "sql",
+    ".prisma": "prisma",
+    # ── Docs ───────────────────────────────────────────────────────────
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".tex": "latex",
+    ".rst": "rst",
+    # ── Hardware / scientific ──────────────────────────────────────────
+    ".v": "verilog",
+    ".sv": "verilog",
+    ".vhdl": "vhdl",
+    ".vhd": "vhdl",
+    ".f": "fortran",
+    ".f90": "fortran",
+    ".f95": "fortran",
+    # ── Game / scripting ───────────────────────────────────────────────
+    ".gd": "gdscript",
+    # ── Assembly ───────────────────────────────────────────────────────
+    ".asm": "asm",
+    ".s": "asm",
+    ".inc": "asm",
 }
 
+# NB: HTML/CSS/SCSS/LESS не добавляем сюда — `_extractor_strategy` ниже
+# отдаёт их специализированным `_extract_stylesheet` / `_extract_template`
+# (selectors, CSS vars, Angular component bindings) ДО tree-sitter, и они
+# точнее. Tree-sitter html/css парсеры доступны, но overrride'нуть стратегию
+# смысла мало — current extractors уже работают хорошо.
+
 _TREE_SITTER_NODE_TYPES = {
+    # Generic class / function / method
     "class_definition",
     "class_declaration",
     "function_definition",
     "function_declaration",
+    "function_signature",  # Dart
     "method_definition",
     "method_declaration",
     "generator_function_declaration",
+    "local_function",  # Lua
+    # Variables / fields
     "lexical_declaration",
     "variable_declaration",
+    "public_field_definition",
+    "field_definition",
+    "pair",
+    "pair_pattern",
+    # Types / interfaces
     "interface_declaration",
     "type_alias_declaration",
     "enum_declaration",
     "abstract_class_declaration",
+    "trait_definition",        # Scala
+    "object_definition",        # Scala
+    "object_declaration",       # Kotlin
+    "mixin_declaration",        # Dart
+    "data_type",                # Haskell
+    # Rust
+    "struct_item",
+    "enum_item",
+    "function_item",
+    "impl_item",
+    "trait_item",
+    "mod_item",
+    "type_item",
+    # Go
+    "type_declaration",
+    "type_spec",
+    # Solidity
+    "contract_declaration",
+    "library_declaration",
+    # Verilog / VHDL
+    "module_declaration",
+    "package_declaration",
+    "entity_declaration",
+    "architecture_body",
+    # Fortran
+    "subroutine",
+    "subroutine_subprogram",
+    "function_subprogram",
+    "module_subprogram",
+    "program_block",
+    # Julia
+    "struct_definition",
+    "module_definition",
+    "abstract_definition",
+    # Markdown
+    "atx_heading",
+    "setext_heading",
+    # HTML / CSS (used by stylesheet/template extractors)
     "element",
     "script_element",
     "style_element",
@@ -85,33 +219,37 @@ _TREE_SITTER_NODE_TYPES = {
     "qualified_rule",
     "class_selector",
     "id_selector",
-    "pair",
-    "pair_pattern",
-    "public_field_definition",
-    "field_definition",
 }
 
 _TREE_SITTER_NAME_FIELDS = ("name", "declarator", "property", "left")
 
 _CODE_EXTENSIONS = [
     "*.py", "*.pyi",
-    "*.js", "*.jsx", "*.ts", "*.tsx", "*.vue", "*.svelte", "*.astro",
-    "*.java", "*.kt", "*.kts", "*.scala", "*.groovy",
-    "*.go", "*.rs", "*.swift", "*.dart", "*.zig",
-    "*.c", "*.h", "*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh",
+    "*.js", "*.mjs", "*.cjs", "*.jsx",
+    "*.ts", "*.mts", "*.cts", "*.tsx",
+    "*.vue", "*.svelte", "*.astro",
+    "*.java", "*.kt", "*.kts", "*.scala", "*.sc", "*.groovy", "*.gradle",
+    "*.go", "*.rs", "*.swift", "*.dart", "*.zig", "*.d",
+    "*.c", "*.h", "*.cpp", "*.cc", "*.cxx", "*.c++", "*.hpp", "*.hh", "*.hxx",
     "*.m", "*.mm", "*.cu", "*.cuh",
-    "*.asm", "*.s", "*.S",
+    "*.asm", "*.s", "*.S", "*.inc",
     "*.cs", "*.fs", "*.vb",
-    "*.php", "*.rb", "*.lua", "*.pl", "*.pm",
-    "*.sh", "*.bash", "*.zsh", "*.fish", "*.ps1",
-    "*.ex", "*.exs", "*.erl", "*.hrl", "*.hs", "*.lhs", "*.clj", "*.cljs",
+    "*.php", "*.phtml", "*.rb", "*.lua", "*.pl", "*.pm", "*.perl",
+    "*.sh", "*.bash", "*.zsh", "*.fish",
+    "*.ps1", "*.psm1", "*.psd1",
+    "*.ex", "*.exs", "*.erl", "*.hrl", "*.hs", "*.lhs",
+    "*.clj", "*.cljs", "*.cljc", "*.edn",
     "*.r", "*.R", "*.jl",
-    "*.sql", "*.graphql", "*.gql", "*.proto",
+    "*.sql", "*.graphql", "*.gql", "*.proto", "*.prisma",
     "*.nim", "*.nims", "*.ml", "*.mli",
     "*.html", "*.htm", "*.css", "*.scss", "*.sass", "*.less",
     "*.jinja", "*.jinja2", "*.j2", "*.njk", "*.hbs", "*.ejs",
     "*.yaml", "*.yml", "*.toml", "*.json",
-    "*.tf", "*.tfvars",
+    "*.tf", "*.tfvars", "*.hcl", "*.nix",
+    "*.sol",
+    "*.md", "*.markdown", "*.tex", "*.rst",
+    "*.v", "*.sv", "*.vhdl", "*.vhd",
+    "*.f", "*.f90", "*.f95",
     "*.gd", "*.gdshader", "*.gdshaderinc", "*.godot", "*.cfg",
 ]
 
