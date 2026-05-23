@@ -170,11 +170,33 @@ class GraphAnalysisMixin:
 
     # ── Dead-code & clone clustering ─────────────────────────────────────────
 
+    # Methods dispatched by Angular runtime — they have no source-level
+    # callers, so dead-code's "zero incoming edges" rule mis-flags them.
+    _ANGULAR_FRAMEWORK_METHODS = frozenset({
+        "ngOnInit", "ngOnDestroy", "ngOnChanges", "ngDoCheck",
+        "ngAfterContentInit", "ngAfterContentChecked",
+        "ngAfterViewInit", "ngAfterViewChecked",
+        "transform", "resolve", "intercept",
+        "canActivate", "canActivateChild", "canDeactivate",
+        "canLoad", "canMatch",
+        "writeValue", "registerOnChange", "registerOnTouched", "setDisabledState",
+        "validate", "ngDoBootstrap",
+    })
+
+    # File-name suffixes whose methods are dispatched by templates / DI / decorators
+    # rather than direct calls. Used when filter_angular=True to suppress those
+    # noisy false positives wholesale.
+    _ANGULAR_FRAMEWORK_FILE_SUFFIXES = (
+        ".component.ts", ".pipe.ts", ".guard.ts", ".interceptor.ts",
+        ".resolver.ts", ".directive.ts", ".module.ts",
+    )
+
     def find_dead_code(
         self,
         entity_types: Optional[list[str]] = None,
         limit: int = 50,
         exclude_paths: Optional[list[str]] = None,
+        filter_angular: bool = True,
     ) -> list[dict]:
         """Entities that no relation points to — never called, used, or instantiated.
 
@@ -183,10 +205,29 @@ class GraphAnalysisMixin:
 
         ``exclude_paths`` is an optional list of fnmatch globs (e.g.
         ``["demoapp/*", "**/*.stories.*"]``).
+
+        ``filter_angular`` (default True) drops two classes of well-known false
+        positives that the call-graph extractor can't see end-to-end:
+          * Methods whose name matches an Angular lifecycle / pipe / resolver /
+            guard / interceptor / ControlValueAccessor hook — those are
+            dispatched by the framework, not via an explicit call site.
+          * Public methods declared in ``*.component.ts`` / ``*.pipe.ts`` /
+            ``*.guard.ts`` / ``*.interceptor.ts`` / ``*.resolver.ts`` /
+            ``*.directive.ts`` files — almost always wired by templates or DI
+            tokens, which tree-sitter doesn't traverse.
+        Set to False to see the raw graph results (useful when auditing
+        backend-only repos, or after the template scanner has been enriched).
         """
         types = entity_types or ["function", "method", "class", "component", "interface"]
         placeholders = ",".join("?" * len(types))
-        sql_limit = limit * 5 if exclude_paths else limit
+        # Over-fetch so client-side filters (exclude_paths, framework filter)
+        # still have enough rows to honour ``limit``.
+        over_fetch = limit
+        if exclude_paths:
+            over_fetch *= 5
+        if filter_angular:
+            over_fetch *= 4
+        sql_limit = max(limit, over_fetch)
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute(
                 f"""
@@ -206,6 +247,15 @@ class GraphAnalysisMixin:
                 """,
                 (*types, sql_limit),
             ).fetchall()
+
+        if filter_angular:
+            hooks = self._ANGULAR_FRAMEWORK_METHODS
+            suffixes = self._ANGULAR_FRAMEWORK_FILE_SUFFIXES
+            rows = [
+                r for r in rows
+                if r[1] not in hooks
+                and not any(r[0].endswith(sfx) for sfx in suffixes)
+            ]
 
         if exclude_paths:
             from fnmatch import fnmatch
@@ -509,6 +559,9 @@ class GraphAnalysisMixin:
             # call sites, type annotations) — those would otherwise dominate
             # PageRank with names like ReactNode/dayjs/AButton in every file
             # that uses them.
+            # Prefer entities with a `defines` edge (cleanest dedup).
+            # Fall back to raw entity list when the graph was built via
+            # tree-sitter / manual write_batch (neither creates `defines`).
             ent_rows = con.execute(
                 "SELECT e.file, e.name, e.type, e.line_start, e.line_end, e.snippet, e.description "
                 "FROM entities e "
@@ -521,6 +574,12 @@ class GraphAnalysisMixin:
                 "      AND r.to_name = e.name"
                 "  )"
             ).fetchall()
+            if not ent_rows:
+                ent_rows = con.execute(
+                    "SELECT e.file, e.name, e.type, e.line_start, e.line_end, e.snippet, e.description "
+                    "FROM entities e "
+                    "WHERE e.type IN ('class','function','method','component','interface','module','enum')"
+                ).fetchall()
             rel_rows = con.execute(
                 "SELECT file, from_name, relation, to_name FROM relations "
                 "WHERE relation IN ('calls','uses','instantiates','inherits','imports')"

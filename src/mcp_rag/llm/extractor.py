@@ -84,6 +84,13 @@ class OpenAICompatExtractor:
         self.model = model or os.getenv("MCP_RAG_LLM_MODEL", "deepseek-chat")
         self.timeout = timeout
         self.extra_headers = dict(extra_headers or {})
+        # Diagnostic string from the most recent extract() call. Empty
+        # string when extraction succeeded normally; a one-line summary
+        # of the failure mode otherwise (HTTP status, empty response,
+        # JSON parse error, etc.). Read by graph_index_file / graph_build
+        # wrappers so users can see *why* entities = 0 without digging
+        # into worker stderr (which Electron silently swallows).
+        self.last_diagnostic: str = ""
 
     def _endpoint_url(self) -> str:
         if not self.base_url:
@@ -105,16 +112,57 @@ class OpenAICompatExtractor:
         return headers
 
     async def extract(self, rel_path: str, code: str) -> dict:
-        truncated = code[:8000] + ("\n... [truncated]" if len(code) > 8000 else "")
+        self.last_diagnostic = ""
+        # Input/output caps are env-tunable. The 8 KB default that used to
+        # ship here silently dropped 80 % of any 40 KB router/service file,
+        # so the LLM saw a fragment and returned either empty results or
+        # JSON broken at the truncation seam. Modern long-context models
+        # (DeepSeek V4-Flash 1M, Claude Sonnet 200K, GPT-4.1 1M, etc.)
+        # handle 100 KB inputs without issues — that covers ~95 % of real
+        # source files. ``max_tokens`` on the response side is generous
+        # enough for even God-files (1000+ entities × ~25 tokens of JSON
+        # each fits in 32 K); the provider only bills actual completion
+        # tokens, so a high cap costs nothing when responses are short.
+        # Override via env on smaller models where 100 KB blows the context.
+        max_chars = _env_int("MCP_RAG_LLM_EXTRACT_MAX_CHARS", 100_000)
+        max_tokens = _env_int("MCP_RAG_LLM_EXTRACT_MAX_TOKENS", 32_000)
+        if len(code) > max_chars:
+            truncated = code[:max_chars] + "\n... [truncated]"
+            logger.info(
+                "LLM extract: truncated %s from %d to %d chars (set MCP_RAG_LLM_EXTRACT_MAX_CHARS to raise)",
+                rel_path, len(code), max_chars,
+            )
+        else:
+            truncated = code
         prompt = _EXTRACT_PROMPT.format(filepath=rel_path, code=truncated)
         try:
-            text = await self.complete(prompt, max_tokens=2048, temperature=0)
+            text = await self.complete(prompt, max_tokens=max_tokens, temperature=0)
         except Exception as e:
+            self.last_diagnostic = f"complete() raised {type(e).__name__}: {e}"
             logger.warning("LLM extract failed for %s: %s", rel_path, e)
             return {"entities": [], "relations": []}
         if not text:
+            self.last_diagnostic = (
+                "complete() returned empty string — check worker logs for HTTP status. "
+                "Common causes: 401 (bad bearer / _DP_USER_TOKEN not set), "
+                "5xx (provider down), connection refused (backend not running)."
+            )
+            logger.warning("LLM extract for %s returned empty response", rel_path)
             return {"entities": [], "relations": []}
-        return _parse_json_lenient(_strip_code_fence(text))
+        result = _parse_json_lenient(_strip_code_fence(text), context=rel_path)
+        # Empty result with a non-empty response usually means the model
+        # produced prose / a code block / a different schema — log a preview
+        # so users can adjust the prompt or model.
+        if not result.get("entities") and not result.get("relations"):
+            self.last_diagnostic = (
+                f"LLM returned {len(text)} chars but parsed to empty graph. "
+                f"Raw response head: {text[:200]!r}"
+            )
+            logger.warning(
+                "LLM extract for %s parsed to empty graph; raw response preview: %r",
+                rel_path, text[:300],
+            )
+        return result
 
     async def complete(self, prompt: str, max_tokens: int = 400, temperature: float = 0.0) -> str:
         """Generic chat-completion. Returns the assistant's text or '' on failure.
@@ -156,16 +204,42 @@ def _strip_code_fence(text: str) -> str:
     return m.group(1).strip() if m else text
 
 
-def _parse_json_lenient(text: str) -> dict:
-    """Parse JSON, falling back to json5 (trailing commas, comments) if available."""
+def _parse_json_lenient(text: str, context: str = "") -> dict:
+    """Parse JSON, falling back to json5 (trailing commas, comments) if available.
+
+    On failure, logs a warning with the parser error and a preview of the
+    offending text so callers can tell "model returned no graph" from
+    "model returned a broken graph the parser dropped".
+    """
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            import json5  # type: ignore[import-not-found]
-        except ImportError:
-            return {"entities": [], "relations": []}
-        try:
-            return json5.loads(text)
-        except Exception:
-            return {"entities": [], "relations": []}
+    except json.JSONDecodeError as e:
+        first_err = e
+    try:
+        import json5  # type: ignore[import-not-found]
+    except ImportError:
+        logger.warning(
+            "LLM extract JSON parse failed for %s (no json5 fallback installed): %s; preview: %r",
+            context or "<unknown>", first_err, text[:300],
+        )
+        return {"entities": [], "relations": []}
+    try:
+        return json5.loads(text)
+    except Exception as e:
+        logger.warning(
+            "LLM extract JSON parse failed for %s (json + json5 both rejected): json=%s; json5=%s; preview: %r",
+            context or "<unknown>", first_err, e, text[:300],
+        )
+        return {"entities": [], "relations": []}
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return default
+    try:
+        n = int(v)
+        return n if n > 0 else default
+    except ValueError:
+        logger.warning("Invalid %s=%r, falling back to %d", name, v, default)
+        return default

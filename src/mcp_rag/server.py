@@ -117,6 +117,11 @@ def _build_tools() -> list[Tool]:
                         "default": False,
                         "description": "If true, run the build as a background asyncio task and return immediately. Use on big projects where the synchronous call would hit Claude Code's ~30s tool-call timeout. Poll graph_stats / graph_pending_files for progress; graph_stats shows '(build in progress)' while it's running.",
                     },
+                    "force_llm": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Force every file through the LLM extractor instead of tree-sitter / regex parsers, AND re-index even non-stale files. Use when tree-sitter mis-parses your dialect (wrong entity types / phantom names in graph_stats), or to fill gaps for languages the deterministic extractors can't handle well. Expensive — one LLM call per file — so pair with ``max_files`` for predictable cost. Requires an LLM extractor configured via MCP_RAG_LLM_* env; otherwise files come back empty.",
+                    },
                 },
             },
         ),
@@ -133,6 +138,236 @@ def _build_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "filepath": {"type": "string", "description": "Path relative to the project root (or absolute)"},
+                    "force_llm": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Skip tree-sitter / structured extractors and run the LLM extractor directly on this file. Use when tree-sitter produced wrong/incomplete results for this specific file (mixed dialect, embedded DSL, unusual syntax). Requires an LLM extractor configured via MCP_RAG_LLM_* env.",
+                    },
+                },
+                "required": ["filepath"],
+            },
+        ),
+        Tool(
+            name="graph_write_batch",
+            description=(
+                "Direct entity/relation write — bypasses tree-sitter and the "
+                "LLM-fallback extractor. Use this when YOU (the calling agent) "
+                "have already extracted the graph for a file via your own "
+                "reasoning over its content, and you want to persist the "
+                "result without re-running mcp-rag's own extraction.\n\n"
+                "Typical caller: a RAG-builder sub-agent that reads source "
+                "files with read_file/grep, decides on the entity list itself "
+                "with multi-file context, and submits each file's graph here.\n\n"
+                "Behaviour: wipes any existing entries for this file then "
+                "inserts the new ones. Validation matches auto-extraction — "
+                "entity types must be in (class, function, method, component, "
+                "interface, import, hook, type, enum, selector, style, "
+                "template, config, variable, symbol, property, service, "
+                "directive, pipe, controller); relations must be in (defines, "
+                "calls, imports, inherits, uses, instantiates). Lines and "
+                "code snippets are auto-filled — you don't need to supply "
+                "them.\n\n"
+                "FAISS is NOT rebuilt on each call (would be O(N²) across a "
+                "batch). Call graph_rebuild_faiss once after the whole batch."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Project-relative path of the file the graph describes.",
+                    },
+                    "entities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "type": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["name", "type"],
+                        },
+                        "description": "Entities defined in this file.",
+                    },
+                    "relations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {"type": "string"},
+                                "relation": {"type": "string"},
+                                "to": {"type": "string"},
+                            },
+                            "required": ["from", "relation", "to"],
+                        },
+                        "description": "Edges from entities in this file to others.",
+                    },
+                    "rebuild_faiss": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Set to true ONLY for the last write of a batch — rebuilds the vector index for search_code/find_similar.",
+                    },
+                },
+                "required": ["filepath", "entities", "relations"],
+            },
+        ),
+        Tool(
+            name="graph_add_entity",
+            description=(
+                "Add a SINGLE entity to the graph for a file, additive "
+                "(does NOT wipe existing rows). Idempotent — re-inserting "
+                "the same (file, name, type) tuple updates the description "
+                "in-place. line_start / line_end / snippet are auto-filled "
+                "from the file content; you only supply name, type, and an "
+                "optional one-line description.\n\n"
+                "Use this when you're walking a file and emitting entities "
+                "incrementally — one tool call per declaration. Pairs with "
+                "``graph_add_relation`` for edges. For files where you "
+                "already have the FULL entity list constructed upfront, "
+                "``graph_write_batch`` is one call instead of N."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Project-relative path of the file the entity lives in.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Entity identifier exactly as it appears in source (case-sensitive).",
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "One of: class, function, method, component, interface, import, hook, type, enum, variable, property, symbol, service, directive, pipe, controller, selector, style, template, config.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional one-line summary (≤200 chars).",
+                    },
+                },
+                "required": ["filepath", "name", "type"],
+            },
+        ),
+        Tool(
+            name="graph_add_relation",
+            description=(
+                "Add a SINGLE relation edge to the graph for a file, "
+                "additive (does NOT wipe). Idempotent — duplicate "
+                "(file, from, relation, to) tuples are silently dropped.\n\n"
+                "Validates ``relation`` against the allowed set (defines, "
+                "calls, imports, inherits, uses, instantiates). ``to`` can "
+                "be either an entity-name (resolves to definitions across "
+                "all files) or a project-relative file path (resolves to "
+                "the corresponding file-entity that mcp-rag auto-creates "
+                "for every indexed file).\n\n"
+                "Typical use: a RAG-builder sub-agent that has run "
+                "``graph_index_file`` (tree-sitter) on a file, then reads "
+                "the source and adds the cross-file ``uses`` edges that "
+                "tree-sitter missed — e.g. ``write_cover_active uses "
+                "cover_active.h`` for a Path.write_text() pattern."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Project-relative path of the file the edge originates in.",
+                    },
+                    "from_name": {
+                        "type": "string",
+                        "description": "Source entity name (a function / class / method / file).",
+                    },
+                    "relation": {
+                        "type": "string",
+                        "description": "One of: defines, calls, imports, inherits, uses, instantiates.",
+                    },
+                    "to_name": {
+                        "type": "string",
+                        "description": "Target name (entity OR project-relative file path).",
+                    },
+                },
+                "required": ["filepath", "from_name", "relation", "to_name"],
+            },
+        ),
+        Tool(
+            name="graph_rebuild_faiss",
+            description=(
+                "Rebuild the FAISS vector index from the current entities "
+                "table. Call this AFTER a batch of graph_write_batch() "
+                "calls have finished writing — until then search_code / "
+                "graph_find_similar still see the prior vector set. "
+                "Idempotent and cheap when the index is already fresh."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="graph_schema",
+            description=(
+                "Return the graph's validation schema — the exact set "
+                "of entity types and relation types accepted by "
+                "``graph_add_entity`` / ``graph_add_relation`` / "
+                "``graph_write_batch``. Anything outside these sets is "
+                "silently dropped on write.\n\n"
+                "Call this ONCE at the start of a build session "
+                "instead of memorising lists from docstrings — the "
+                "schema lives in mcp-rag's code and is authoritative."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="graph_invalidate",
+            description=(
+                "Flag a file (and optionally its dependents) as needing "
+                "reindex. Sets ``file_meta.mtime=0`` so the next "
+                "``graph_pending_files`` / ``rag_rebuild scope=stale`` "
+                "call picks them up.\n\n"
+                "Entities/relations are NOT deleted — old data stays "
+                "queryable until a real reindex runs. Use after the "
+                "agent has edited a file: the disk file's mtime "
+                "auto-bumps so the file itself is detected as stale, "
+                "but its dependents (importers, callers) need an "
+                "explicit cascade because their mtime didn't change.\n\n"
+                "Default ``cascade=true`` marks the target file PLUS "
+                "every file whose graph entries depend on entities "
+                "defined in the target (via the same logic as "
+                "``graph_affected_files``)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Project-relative path of the changed file.",
+                    },
+                    "cascade": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "If true, also mark dependents stale.",
+                    },
+                },
+                "required": ["filepath"],
+            },
+        ),
+        Tool(
+            name="graph_affected_files",
+            description=(
+                "Reverse-impact query: which files in the graph depend on "
+                "``filepath``'s exported entities. Use this for incremental "
+                "RAG rebuilds — when one file changes, this tool returns "
+                "the minimal set of neighbours that also need re-indexing "
+                "(those that call/use/import names defined in the changed "
+                "file). The target file is always included in the result.\n\n"
+                "Returns a JSON dict ``{target: rel, files: [...]}``."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Project-relative path of the changed file.",
+                    },
                 },
                 "required": ["filepath"],
             },
@@ -360,6 +595,11 @@ def _build_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Optional fnmatch globs to skip (e.g. ['demoapp/*', '**/*.stories.*']) — useful for hiding scaffolding where no-usages is expected.",
+                    },
+                    "filter_angular": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Drop Angular lifecycle hooks (ngOnInit, transform, resolve, canActivate, intercept, …) and methods declared in *.component.ts / *.pipe.ts / *.guard.ts / *.interceptor.ts / *.resolver.ts / *.directive.ts / *.module.ts files. These are dispatched by templates/DI/decorators rather than direct calls, so they show up as false-positive 'dead' otherwise. Set false to see the raw graph result.",
                     },
                 },
             },
@@ -918,6 +1158,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
     if name == "graph_build":
         cap = args.get("max_files")
         cap = int(cap) if cap is not None else None
+        force_llm = bool(args.get("force_llm", False))
         if bool(args.get("background", False)):
             existing = services._build_task
             if existing is not None and not existing.done():
@@ -928,7 +1169,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
                 )
             async def _bg_build():
                 try:
-                    result = await g.build(max_files=cap)
+                    result = await g.build(max_files=cap, force_llm=force_llm)
                     logger.info("Background graph_build done: %s", result)
                 except Exception:
                     logger.exception("Background graph_build failed")
@@ -936,11 +1177,12 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             status = g.get_build_status()
             return (
                 f"Background build started — {status['stale_files']} stale, "
-                f"{status['deleted_files']} deleted out of {status['total_files']} project files. "
+                f"{status['deleted_files']} deleted out of {status['total_files']} project files"
+                f"{' (force_llm)' if force_llm else ''}. "
                 f"Poll graph_stats / graph_pending_files; graph_stats shows '(build in progress)' "
                 f"while it's running."
             )
-        result = await g.build(max_files=cap)
+        result = await g.build(max_files=cap, force_llm=force_llm)
         return json.dumps(result, indent=2)
 
     if name == "graph_index_file":
@@ -949,10 +1191,89 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             path = services.config.project_root / path
         if not path.exists():
             return f"File not found: {args['filepath']}"
-        await g.reindex_file(path)
+        force_llm = bool(args.get("force_llm", False))
+        await g.reindex_file(path, force_llm=force_llm)
         rel = path.relative_to(services.config.project_root).as_posix()
         entities = g.get_file_entities(rel)
-        return f"Indexed {rel}: {len(entities)} entities."
+        return f"Indexed {rel}: {len(entities)} entities{' (LLM)' if force_llm else ''}."
+
+    if name == "graph_write_batch":
+        path = Path(args["filepath"])
+        if not path.is_absolute():
+            path = services.config.project_root / path
+        if not path.exists():
+            return f"File not found: {args['filepath']}"
+        result = g.write_batch(
+            filepath=path,
+            entities=args.get("entities") or [],
+            relations=args.get("relations") or [],
+            rebuild_faiss=bool(args.get("rebuild_faiss", False)),
+        )
+        if result.get("skipped"):
+            return f"Skipped {result['file']}: {result['skipped']}"
+        return (
+            f"Wrote graph for {result['file']}: "
+            f"{result['entities']} entities, {result['relations']} relations"
+            + (" (faiss rebuilt)" if args.get("rebuild_faiss") else " (faiss deferred)")
+        )
+
+    if name == "graph_add_entity":
+        path = Path(args["filepath"])
+        if not path.is_absolute():
+            path = services.config.project_root / path
+        if not path.exists():
+            return f"File not found: {args['filepath']}"
+        result = g.add_entity(
+            filepath=path,
+            name=args["name"],
+            type=args["type"],
+            description=args.get("description") or "",
+        )
+        if result.get("skipped"):
+            return f"Skipped {result['file']}: {result['skipped']}"
+        return f"Added entity {result['name']} ({result['type']}) to {result['file']}."
+
+    if name == "graph_add_relation":
+        path = Path(args["filepath"])
+        if not path.is_absolute():
+            path = services.config.project_root / path
+        if not path.exists():
+            return f"File not found: {args['filepath']}"
+        result = g.add_relation(
+            filepath=path,
+            from_name=args["from_name"],
+            relation=args["relation"],
+            to_name=args["to_name"],
+        )
+        if result.get("skipped"):
+            return f"Skipped {result['file']}: {result['skipped']}"
+        if result.get("duplicate"):
+            return f"Duplicate (ignored): {result['from']} --{result['relation']}--> {result['to']} in {result['file']}."
+        return f"Added relation: {result['from']} --{result['relation']}--> {result['to']} in {result['file']}."
+
+    if name == "graph_rebuild_faiss":
+        g.rebuild_faiss()
+        return "FAISS index rebuilt."
+
+    if name == "graph_schema":
+        return json.dumps(g.get_schema(), indent=2)
+
+    if name == "graph_invalidate":
+        path = Path(args["filepath"])
+        if not path.is_absolute():
+            path = services.config.project_root / path
+        result = g.mark_stale(filepath=path, cascade=bool(args.get("cascade", True)))
+        marked = result.get("marked", [])
+        if not marked:
+            return f"No files marked (target not in graph): {args['filepath']}"
+        return f"Marked {len(marked)} file(s) stale:\n  " + "\n  ".join(marked)
+
+    if name == "graph_affected_files":
+        path = Path(args["filepath"])
+        if not path.is_absolute():
+            path = services.config.project_root / path
+        result = g.affected_files(path)
+        return json.dumps(result, indent=2)
 
     if name == "graph_search":
         q = args["query"]
@@ -1185,7 +1506,13 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         types = args.get("entity_types") or None
         limit = max(1, min(int(args.get("limit", 50)), 500))
         exclude_paths = args.get("exclude_paths") or None
-        results = g.find_dead_code(entity_types=types, limit=limit, exclude_paths=exclude_paths)
+        filter_angular = bool(args.get("filter_angular", True))
+        results = g.find_dead_code(
+            entity_types=types,
+            limit=limit,
+            exclude_paths=exclude_paths,
+            filter_angular=filter_angular,
+        )
         if not results:
             return "No dead code found (every defined entity is referenced somewhere)."
         lines = [

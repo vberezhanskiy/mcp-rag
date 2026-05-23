@@ -36,6 +36,11 @@ _ALLOWED_ENTITY_TYPES = {
     "hook", "type", "enum", "selector", "style", "template", "config", "variable", "symbol", "property",
     # Framework-specific (Angular / NestJS / React hooks)
     "service", "directive", "pipe", "controller",
+    # HTTP/WS routes — same URL path string on frontend (consumer) and
+    # backend (handler) lets the graph stitch cross-stack edges that
+    # would otherwise be invisible (path is a string literal at both
+    # ends, not a Python/TS identifier).
+    "endpoint",
 }
 
 _ALLOWED_RELATION_TYPES = {
@@ -271,6 +276,90 @@ _IGNORE_DIRS = {
 # generated SQL dumps, ML weights. Tree-sitter and regex extractors can hang
 # or balloon memory on multi-MB inputs.
 _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+# ── Angular template expression scanning ─────────────────────────────────────
+# Tree-sitter has no HTML extractor wired up, so methods invoked only from
+# templates (.html plus inline `template:` strings) were invisible to the call
+# graph — and graph_dead_code flagged every (click)-bound method as orphan.
+# These regexes power _extract_template's binding scan; kept module-level so
+# they compile once. Coverage:
+#   - Event/property/two-way bindings:    (click)="save()"  [disabled]="x"  [(ngModel)]="y"
+#   - Structural directives (legacy):     *ngIf="ready"  *ngFor="let u of users()"
+#   - Interpolation:                      {{ user.fullName() }}
+#   - Angular 17 control flow:            @if (cond) { … } @for (x of items; track …)
+#   - Local declarations:                 @let total = sum(items);
+_BINDING_ATTR_RE = re.compile(
+    r'(?:\([\w.-]+\)|\[\(?[\w.()-]+\)?\]|\*[\w-]+)\s*=\s*["\']([^"\']+)["\']'
+)
+_INTERPOLATION_RE = re.compile(r'\{\{([^}]+)\}\}')
+_CONTROL_FLOW_RE = re.compile(
+    r'@(?:if|else\s+if|for|switch|case|defer|placeholder|loading|error|empty)'
+    r'\b[^{;]*?\(([^)]*)\)?'
+)
+_LET_DECL_RE = re.compile(r'@let\s+\w+\s*=\s*([^;]+);')
+_TEMPLATE_METHOD_CALL_RE = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(')
+_TEMPLATE_IDENT_RE = re.compile(r'\b([a-zA-Z_][A-Za-z0-9_]*)\b(?!\s*\()')
+
+# Template-expression reserved words / Angular built-ins / control-flow trigger
+# names that look like identifiers but aren't class members. Filtered out so
+# they don't pollute the relations table with edges to nonexistent entities.
+# Always filtered, in both 'calls' and 'uses' contexts. These are JS literals
+# or block-trigger keywords that can't possibly name a user-defined entity.
+_TEMPLATE_HARD_KEYWORDS = frozenset({
+    "true", "false", "null", "undefined", "this", "void",
+    "let", "as", "of", "in", "track",
+    "else", "if", "switch", "case", "default", "empty",
+})
+
+# Filtered only when seen as a bare identifier (a 'uses' edge). If the same
+# word appears with parens (a 'calls' edge) it's a user method or signal —
+# we keep it. Includes:
+#   * structural-directive triggers that share names with valid identifiers
+#     (`for`, `defer`, `placeholder`, `loading`, `error`, `prefetch`, `when`,
+#     `on`, `idle`, `viewport`, `interaction`, `hover`, `immediate`, `timer`);
+#   * legacy `*ngFor` implicit locals (`index`, `first`, `last`, `even`, `odd`,
+#     `count`) — Angular 17 uses `$index`/`$count` so plain forms are rare in
+#     modern code but appear in legacy templates.
+_TEMPLATE_EXPR_KEYWORDS = frozenset({
+    "for", "defer", "placeholder", "loading", "error", "prefetch",
+    "when", "on", "idle", "viewport", "interaction", "hover",
+    "immediate", "timer",
+    "index", "first", "last", "even", "odd", "count",
+})
+
+# JS literals / keywords that may appear inside provideX(...) / withX(...)
+# argument lists; filtered out so they don't become phantom 'uses' targets.
+_ANGULAR_RUNTIME_KEYWORDS = frozenset({
+    "true", "false", "null", "undefined", "void", "this",
+    "new", "await", "async", "return", "import", "from", "as",
+})
+
+# Names that Angular runtime resolves by interface, not by call site. They have
+# no callers in source — the framework dispatches them. Filtered out of
+# graph_dead_code so lifecycle hooks / pipe transforms / resolvers / guards
+# / interceptors / ControlValueAccessor methods aren't reported as dead.
+_ANGULAR_LIFECYCLE_HOOKS = frozenset({
+    # Component / Directive
+    "ngOnInit", "ngOnDestroy", "ngOnChanges", "ngDoCheck",
+    "ngAfterContentInit", "ngAfterContentChecked",
+    "ngAfterViewInit", "ngAfterViewChecked",
+    # Pipe
+    "transform",
+    # Resolver
+    "resolve",
+    # HttpInterceptor
+    "intercept",
+    # Route guards (functional + class-based)
+    "canActivate", "canActivateChild", "canDeactivate",
+    "canLoad", "canMatch",
+    # ControlValueAccessor
+    "writeValue", "registerOnChange", "registerOnTouched", "setDisabledState",
+    # Validator / AsyncValidator
+    "validate",
+    # Bootstrap
+    "ngDoBootstrap",
+})
 
 
 # ── Trait detection: per-language regex patterns ────────────────────────────
@@ -777,6 +866,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         entities = [self._make_file_entity(rel_path, "template", "Template file")]
         relations: list[dict] = []
         seen_entities = {rel_path}
+        seen_relations: set[tuple[str, str, str]] = set()
 
         def _add_entity(name: str, entity_type: str, description: str) -> None:
             name = self._normalize_whitespace(name, limit=160)
@@ -784,7 +874,40 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 return
             seen_entities.add(name)
             entities.append({"name": name, "type": entity_type, "description": description})
-            relations.append({"from": rel_path, "relation": "defines", "to": name})
+            key = (rel_path, "defines", name)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relations.append({"from": rel_path, "relation": "defines", "to": name})
+
+        def _add_ref(relation: str, name: str) -> None:
+            name = self._normalize_whitespace(name, limit=160)
+            if not name:
+                return
+            # Skip microsyntax tokens / Angular implicits only for the bare-ident
+            # ('uses') scan — if the source actually writes `count()` with parens
+            # that's clearly a method/signal call and must be recorded even
+            # when the bare word `count` is a *ngFor implicit local.
+            if relation == "uses" and name in _TEMPLATE_EXPR_KEYWORDS:
+                return
+            # Reserved JS literals / block-trigger keywords never refer to a
+            # user-defined entity in either context.
+            if name in _TEMPLATE_HARD_KEYWORDS:
+                return
+            # If we already recorded a 'calls' edge to this name, skip the
+            # weaker 'uses' duplicate — dead-code treats both as live anyway.
+            if relation == "uses" and (rel_path, "calls", name) in seen_relations:
+                return
+            key = (rel_path, relation, name)
+            if key in seen_relations:
+                return
+            seen_relations.add(key)
+            relations.append({"from": rel_path, "relation": relation, "to": name})
+
+        def _scan_expression(expr: str) -> None:
+            for m in _TEMPLATE_METHOD_CALL_RE.finditer(expr):
+                _add_ref("calls", m.group(1))
+            for m in _TEMPLATE_IDENT_RE.finditer(expr):
+                _add_ref("uses", m.group(1))
 
         for tag in re.findall(r"<([A-Za-z][A-Za-z0-9:_-]*)", code):
             entity_type = "component" if ("-" in tag or ":" in tag) else "template"
@@ -797,7 +920,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             # Component tags are USED by this template (not defined here);
             # the defining edge comes from the @Component class on the .ts side.
             relation = "uses" if entity_type == "component" else "defines"
-            relations.append({"from": rel_path, "relation": relation, "to": tag_norm})
+            key = (rel_path, relation, tag_norm)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relations.append({"from": rel_path, "relation": relation, "to": tag_norm})
 
         for class_block in re.findall(r'class(?:Name)?\s*=\s*["\']([^"\']+)["\']', code):
             for cls in re.split(r"\s+", class_block.strip()):
@@ -806,6 +932,20 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
         for item_id in re.findall(r'id\s*=\s*["\']([^"\']+)["\']', code):
             _add_entity(f"#{item_id}", "selector", "Template id selector")
+
+        # Angular bindings → method/property edges so dead-code stops flagging
+        # template-driven methods as orphans.
+        #   (click)="save()"  [disabled]="isLoading"  *ngIf="hasAny(roles)"
+        #   [(ngModel)]="value"  @if (hasAny(['admin'])) {  @for (u of users(); ...) {
+        #   @let total = sum(items);  {{ user.fullName() }}
+        for m in _BINDING_ATTR_RE.finditer(code):
+            _scan_expression(m.group(1))
+        for m in _INTERPOLATION_RE.finditer(code):
+            _scan_expression(m.group(1))
+        for m in _CONTROL_FLOW_RE.finditer(code):
+            _scan_expression(m.group(1))
+        for m in _LET_DECL_RE.finditer(code):
+            _scan_expression(m.group(1))
 
         return {"entities": entities, "relations": relations}
 
@@ -1156,6 +1296,77 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     out.append((owner, m_id.group(0)))
         return out
 
+    @staticmethod
+    def _angular_runtime_references(code: str, rel_path: str, suffix: str) -> list[tuple[str, str]]:
+        """Identifiers wired by Angular runtime APIs the call-graph would otherwise miss.
+
+        Covers the four ways modern Angular apps reference services / guards /
+        components without an explicit call site:
+
+          * Standalone bootstrap helpers:  ``provideRouter(routes)``,
+            ``provideHttpClient(withInterceptors([jwt, error]))``,
+            ``provideAnimations()`` — the inner identifiers are wired by the DI
+            container, never called directly.
+          * Route guard / resolver arrays: ``canActivate: [authGuard]``,
+            ``resolve: { user: UserResolver }``.
+          * Provider config objects: ``{ provide: X, useFactory: initAuth }``
+            / ``useClass: FooImpl`` / ``useExisting: BarToken``.
+          * Route component refs: ``{ path: 'home', component: HomeComponent }``.
+
+        Returns ``(from_entity, dep_name)`` tuples — ``from_entity`` is the file
+        path because these references usually live at module scope, not inside
+        a class.
+        """
+        if suffix not in {".ts", ".js", ".mts", ".cts", ".mjs", ".cjs"}:
+            return []
+        out: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _emit(dep: str) -> None:
+            if not dep or dep[:1].isdigit():
+                return
+            if dep in _ANGULAR_RUNTIME_KEYWORDS:
+                return
+            key = (rel_path, dep)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(key)
+
+        # provideXxx(...) / withXxx(...) — standalone API surface.
+        for m in re.finditer(r'\b(?:provide|with)[A-Z]\w*\s*\(([^)]*)\)', code):
+            for m_id in re.finditer(r'\b([A-Za-z_]\w*)\b', m.group(1)):
+                _emit(m_id.group(1))
+
+        # Route guard / resolver arrays.
+        for m in re.finditer(
+            r'\b(?:canActivate|canActivateChild|canDeactivate|canLoad|canMatch)'
+            r'\s*:\s*\[([^\]]*)\]',
+            code,
+        ):
+            for m_id in re.finditer(r'\b([A-Za-z_]\w*)\b', m.group(1)):
+                _emit(m_id.group(1))
+
+        # resolve: { key: Resolver, ... }  — object form, distinct from the
+        # method named 'resolve' on a Resolver class.
+        for m in re.finditer(r'\bresolve\s*:\s*\{([^}]*)\}', code):
+            for m_id in re.finditer(r':\s*([A-Z]\w*)', m.group(1)):
+                _emit(m_id.group(1))
+
+        # Provider object forms.
+        for m in re.finditer(r'\buse(?:Factory|Class|Existing)\s*:\s*([A-Za-z_]\w*)', code):
+            _emit(m.group(1))
+
+        # Route component refs.
+        for m in re.finditer(r'\bcomponent\s*:\s*([A-Z]\w*)', code):
+            _emit(m.group(1))
+
+        # Lazy-loaded routes: loadComponent: () => import('...').then(m => m.FooComponent)
+        for m in re.finditer(r'\bm\s*\.\s*([A-Z]\w*)\s*\)', code):
+            _emit(m.group(1))
+
+        return out
+
     def _extract_with_tree_sitter(self, filepath: Path, code: str) -> dict:
         parser = self._get_tree_sitter_parser(filepath)
         rel_path = filepath.relative_to(self.project_root).as_posix()
@@ -1237,6 +1448,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 seen_relations.add(key)
                 relations.append({"from": owner, "relation": "uses", "to": dep})
 
+        # Standalone provideX / withX / canActivate arrays / useFactory etc.
+        # — see _angular_runtime_references for the full list of patterns.
+        for owner, dep in self._angular_runtime_references(code, rel_path, suffix):
+            if dep not in seen_entities:
+                seen_entities.add(dep)
+                entities.append({
+                    "name": dep,
+                    "type": self._infer_symbol_entity_type(dep),
+                    "description": "Angular runtime reference",
+                })
+            key = (owner, "uses", dep)
+            if key not in seen_relations:
+                seen_relations.add(key)
+                relations.append({"from": owner, "relation": "uses", "to": dep})
+
         # @Component({selector, templateUrl, styleUrls}) — link the class to
         # its template tag, html file, and stylesheet so graph_find_usages
         # of either side surfaces the other.
@@ -1281,7 +1507,19 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
         return {"entities": entities, "relations": relations}
 
-    async def _extract_with_strategy(self, filepath: Path, code: str) -> tuple[dict, str]:
+    async def _extract_with_strategy(
+        self, filepath: Path, code: str, force_llm: bool = False
+    ) -> tuple[dict, str]:
+        rel_path = filepath.relative_to(self.project_root).as_posix()
+        # ``force_llm`` skips tree-sitter / structured extractors and goes
+        # directly to the LLM. Used when the caller explicitly wants a
+        # semantic extraction (e.g. tree-sitter mis-parses a dialect, or the
+        # file is in a language the deterministic extractors don't cover
+        # well). Returns whatever the LLM produced — including empty when
+        # no LLM is configured (NoOpExtractor) — so the caller sees the
+        # outcome instead of silently falling back.
+        if force_llm:
+            return await self.llm_extractor.extract(rel_path, code), "llm"
         strategy = self._extractor_strategy(filepath)
         if strategy == "tree_sitter":
             extracted = self._extract_with_tree_sitter(filepath, code)
@@ -1291,7 +1529,6 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             structured = self._extract_structured(filepath, code)
             if structured.get("entities") or structured.get("relations"):
                 return structured, strategy
-        rel_path = filepath.relative_to(self.project_root).as_posix()
         return await self.llm_extractor.extract(rel_path, code), "llm"
 
     @staticmethod
@@ -1376,8 +1613,18 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 traits = self._detect_traits(
                     e.get("name", ""), e.get("snippet", ""), rel_path, e.get("type", ""),
                 )
+                # ON CONFLICT preserves richer description/snippet from an
+                # earlier indexing pass when this re-insert carries empty
+                # text — see add_entity for the same pattern and rationale.
                 con.execute(
-                    "INSERT OR REPLACE INTO entities(file, name, type, description, line_start, line_end, snippet, traits) VALUES(?,?,?,?,?,?,?,?)",
+                    """INSERT INTO entities(file, name, type, description, line_start, line_end, snippet, traits)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(file, name, type) DO UPDATE SET
+                        description = COALESCE(NULLIF(excluded.description, ''), description),
+                        line_start  = COALESCE(excluded.line_start, line_start),
+                        line_end    = COALESCE(excluded.line_end, line_end),
+                        snippet     = COALESCE(NULLIF(excluded.snippet, ''), snippet),
+                        traits      = excluded.traits""",
                     (
                         rel_path,
                         e.get("name", ""),
@@ -1407,8 +1654,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 (rel, mtime),
             )
 
-    async def index_file(self, filepath: Path) -> None:
-        if not self._file_needs_update(filepath):
+    async def index_file(self, filepath: Path, force_llm: bool = False) -> None:
+        # ``force_llm`` bypasses the freshness check and the tree-sitter /
+        # structured extractors: the file is sent straight to the LLM
+        # extractor, even if it was already indexed by tree-sitter. Use
+        # when re-indexing a file whose semantic extraction needs the LLM
+        # (e.g. tree-sitter pulled garbage names, mixed-dialect file).
+        if not force_llm and not self._file_needs_update(filepath):
             return
         rel = filepath.relative_to(self.project_root).as_posix()
         try:
@@ -1424,7 +1676,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 self._mark_file_seen(rel, mtime)
                 return
             self._delete_file_data(rel)
-            raw_data, strategy = await self._extract_with_strategy(filepath, code)
+            raw_data, strategy = await self._extract_with_strategy(filepath, code, force_llm=force_llm)
             data = self._sanitize_extracted(rel, raw_data)
             entities_count = len(data.get("entities", []))
             relations_count = len(data.get("relations", []))
@@ -1444,14 +1696,502 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         except Exception as e:
             logger.warning("Failed to index %s: %s", filepath, e)
 
-    async def reindex_file(self, filepath: Path, rebuild_faiss: bool = True) -> None:
+    async def reindex_file(
+        self, filepath: Path, rebuild_faiss: bool = True, force_llm: bool = False
+    ) -> None:
         rel = filepath.relative_to(self.project_root).as_posix()
         self._delete_file_data(rel)
-        await self.index_file(filepath)
+        await self.index_file(filepath, force_llm=force_llm)
         if rebuild_faiss:
             self._rebuild_faiss()
         else:
             self._faiss_dirty = True
+
+    def write_batch(
+        self,
+        filepath: "Path | str",
+        entities: list[dict],
+        relations: list[dict],
+        rebuild_faiss: bool = False,
+    ) -> dict:
+        """Direct graph write — bypasses tree-sitter / LLM extractor pipeline.
+
+        Use case: a RAG-builder sub-agent does extraction itself (its own
+        LLM call over multi-file context) and submits the resulting graph
+        via this method. Skips ``_extract_with_strategy`` but reuses
+        ``_sanitize_extracted`` and ``_store_extracted`` so the resulting
+        rows are byte-identical to auto-extraction — same validation,
+        same entity-type allowlist, same line/snippet enrichment.
+
+        Args:
+            filepath: Relative or absolute path. Must exist on disk so
+                ``_find_entity_snippet`` can locate line numbers and
+                ``stat().st_mtime`` can be recorded.
+            entities: List of dicts with at least ``name`` and ``type``.
+                ``description`` optional. Line/snippet are auto-filled
+                from the file content via ``_enrich_entity_locations``,
+                so the caller doesn't need to compute them.
+            relations: List of dicts with ``from``, ``relation``, ``to``.
+                Unknown relation types are dropped silently.
+            rebuild_faiss: When True, rebuilds the FAISS index immediately.
+                A sub-agent writing many files at once should leave this
+                False and call ``_rebuild_faiss()`` once at the end —
+                rebuilding per-file would be O(N²) on the entity corpus.
+
+        Returns:
+            ``{"file": rel_path, "entities": N, "relations": M}`` —
+            counts after sanitize. The number written may be less than
+            the number passed in if entries failed validation.
+        """
+        if isinstance(filepath, str):
+            filepath = Path(filepath)
+        if not filepath.is_absolute():
+            filepath = self.project_root / filepath
+        rel = filepath.relative_to(self.project_root).as_posix()
+        try:
+            mtime = filepath.stat().st_mtime
+        except OSError:
+            # File got deleted between the sub-agent's read and this write.
+            # Skip — _cleanup_deleted_files on the next graph_build will
+            # take care of any stale entries.
+            logger.warning("write_batch: %s vanished from disk, skipping", rel)
+            return {"file": rel, "entities": 0, "relations": 0, "skipped": "file_not_found"}
+
+        # R3 enforcement: code-extension file with entities but ZERO relations
+        # means the caller skipped the import block (every code file has
+        # imports at the top). Reject so the model is forced to re-read and
+        # emit them. Non-code assets (.html/.css/.json/.md) are exempt.
+        # Reverse-grep writes (entities=[], relations=[...]) are also exempt
+        # — that branch is handled below by the additive guard.
+        _CODE_EXTS = {
+            ".py", ".pyi",
+            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+            ".go", ".rs", ".java", ".kt", ".scala",
+            ".cs", ".cpp", ".cc", ".c", ".h", ".hpp",
+            ".rb", ".php", ".swift",
+            # Templates with behaviour: Angular .html has (click)/[binding]
+            # handlers and <component-selector> references, Vue/Svelte
+            # carry script + template + event handlers in one file.
+            ".html", ".vue", ".svelte",
+        }
+        if entities and not relations and filepath.suffix.lower() in _CODE_EXTS:
+            return {
+                "file": rel,
+                "entities": 0,
+                "relations": 0,
+                "skipped": (
+                    "R3 violated: code/template file requires ≥1 relation. "
+                    "For source files: emit --imports--> edges from the "
+                    "import block. For Angular/Vue/Svelte templates: emit "
+                    "--uses--> for each <component-selector> referenced and "
+                    "--calls--> for each (click)/(submit)/event-handler. "
+                    "Re-read the file and resubmit with relations populated."
+                ),
+            }
+
+        # Wipe-then-write is the default (mirrors index_file — gives
+        # idempotent re-indexing). BUT guard against destructive
+        # reverse-grep calls: when the caller passes only relations
+        # (entities=[], relations=[edge,...]) the intent is "add edges
+        # to an already-indexed file", NOT "replace it". Wiping would
+        # destroy the file's previously-indexed entities. So only wipe
+        # when entities are present, or when both lists are empty
+        # (explicit full clear of this file).
+        if entities or not relations:
+            self._delete_file_data(rel)
+        else:
+            logger.info(
+                "write_batch: %s called with entities=[] and %d relations "
+                "— treating as additive reverse-grep write, skipping wipe",
+                rel, len(relations),
+            )
+
+        raw = {"entities": entities or [], "relations": relations or []}
+        data = self._sanitize_extracted(rel, raw)
+        self._store_extracted(rel, mtime, data)
+
+        if rebuild_faiss:
+            self._rebuild_faiss()
+        else:
+            # Defer the costly FAISS rebuild. Caller should explicitly
+            # invoke ``_rebuild_faiss()`` after the batch finishes; until
+            # then ``search_code`` will see the old vector set.
+            self._faiss_dirty = True
+
+        return {
+            "file": rel,
+            "entities": len(data["entities"]),
+            "relations": len(data["relations"]),
+        }
+
+    def rebuild_faiss(self) -> None:
+        """Public alias for the FAISS reindex — called by RAG-builder
+        sub-agents after a batch of write_batch() calls to surface the
+        new entities to ``search_code`` / ``graph_find_similar``.
+        """
+        self._rebuild_faiss()
+
+    def add_entity(
+        self,
+        filepath: "Path | str",
+        name: str,
+        type: str,
+        description: str = "",
+    ) -> dict:
+        """Add a single entity to the graph WITHOUT wiping the file's
+        existing rows. Idempotent — the entities table has a UNIQUE
+        constraint on ``(file, name, type)`` so re-inserting the same
+        triple updates the description / snippet in-place.
+
+        Auto-fills line_start / line_end / snippet via the same
+        ``_enrich_entity_locations`` helper auto-extraction uses, so
+        the caller doesn't need to supply them. The file-entity row
+        (the ``module`` record that ``_make_file_entity`` creates for
+        every indexed file) is auto-created on first call so relations
+        targeting this file resolve cleanly.
+
+        Used by RAG-builder sub-agents that read source themselves and
+        add entities one at a time as they walk the file — simpler
+        per-call shape than ``write_batch`` (which requires the full
+        entities + relations arrays upfront).
+        """
+        if isinstance(filepath, str):
+            filepath = Path(filepath)
+        if not filepath.is_absolute():
+            filepath = self.project_root / filepath
+        rel = filepath.relative_to(self.project_root).as_posix()
+        try:
+            mtime = filepath.stat().st_mtime
+        except OSError:
+            logger.warning("add_entity: %s vanished from disk, skipping", rel)
+            return {"file": rel, "added": 0, "skipped": "file_not_found"}
+
+        # Sanitize through the same pipeline as full extraction —
+        # validates entity type against _ALLOWED_ENTITY_TYPES and
+        # enriches line/snippet.
+        sanitized = self._sanitize_extracted(rel, {
+            "entities": [{"name": name, "type": type, "description": description}],
+            "relations": [],
+        })
+        if not sanitized["entities"]:
+            return {"file": rel, "added": 0, "skipped": "invalid_type_or_empty_name"}
+
+        with sqlite3.connect(self.db_path) as con:
+            # Self-heal: ensure the file-entity exists. ``add_entity`` may
+            # be the first call for a file (no prior tree-sitter pass),
+            # in which case ``_make_file_entity`` never ran. Without this
+            # row, relations targeting this file's path won't have an
+            # endpoint to resolve against.
+            con.execute(
+                "INSERT OR IGNORE INTO entities(file, name, type, description) VALUES(?,?,?,?)",
+                (rel, rel, "module", "Source file"),
+            )
+            for e in sanitized["entities"]:
+                traits = self._detect_traits(
+                    e.get("name", ""), e.get("snippet", ""), rel, e.get("type", ""),
+                )
+                # Use ON CONFLICT (not INSERT OR REPLACE) so a re-insert with
+                # empty description/snippet does NOT overwrite the richer text
+                # captured by an earlier pass. Common scenario: the primary
+                # indexing pass writes a full description, then the reverse-
+                # grep pass (or another sub-agent invocation) re-adds the
+                # same entity with description="" — without COALESCE the
+                # rich text would be wiped, leaving search worse than before.
+                con.execute(
+                    """INSERT INTO entities(file, name, type, description, line_start, line_end, snippet, traits)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(file, name, type) DO UPDATE SET
+                        description = COALESCE(NULLIF(excluded.description, ''), description),
+                        line_start  = COALESCE(excluded.line_start, line_start),
+                        line_end    = COALESCE(excluded.line_end, line_end),
+                        snippet     = COALESCE(NULLIF(excluded.snippet, ''), snippet),
+                        traits      = excluded.traits""",
+                    (
+                        rel, e["name"], e["type"], e.get("description", ""),
+                        e.get("line_start"), e.get("line_end"),
+                        e.get("snippet", ""), traits,
+                    ),
+                )
+                # Auto-emit ``file --defines--> entity``. This edge is
+                # trivially true for every declared entity ("the file
+                # this is declared in defines it") — sub-agents shouldn't
+                # spend tool calls re-asserting it. By auto-emitting, the
+                # K/M ratio surfaces ONLY the meaningful cross-entity
+                # edges (calls / uses / imports / inherits / instantiates)
+                # the agent actively wrote, which is the better signal
+                # for "is this graph well-connected".
+                con.execute(
+                    "INSERT OR IGNORE INTO relations(file, from_name, relation, to_name) VALUES(?,?,?,?)",
+                    (rel, rel, "defines", e["name"]),
+                )
+            con.execute(
+                "INSERT OR REPLACE INTO file_meta(file, mtime, indexed) VALUES(?,?,1)",
+                (rel, mtime),
+            )
+
+        # FAISS rebuild deferred — caller batches add_entity() calls and
+        # invokes graph_rebuild_faiss() once at the end.
+        self._faiss_dirty = True
+        return {"file": rel, "added": len(sanitized["entities"]), "name": name, "type": sanitized["entities"][0]["type"]}
+
+    def add_relation(
+        self,
+        filepath: "Path | str",
+        from_name: str,
+        relation: str,
+        to_name: str,
+    ) -> dict:
+        """Add a single relation edge to the graph WITHOUT wiping the
+        file's existing rows. Idempotent — the relations table has a
+        UNIQUE constraint on ``(file, from_name, relation, to_name)``
+        so duplicate calls are silently dropped.
+
+        Validates ``relation`` against ``_ALLOWED_RELATION_TYPES``.
+        Trims/normalizes ``from_name`` and ``to_name`` the same way
+        the bulk-write path does. Used by RAG-builder sub-agents to
+        layer cross-file build-time edges (e.g.
+        ``write_cover_active uses cover_active.h``) one at a time.
+
+        Note: relations point at NAMES, not files — so ``to_name`` can
+        be either a file-entity name (``"cover_active.h"`` to link to
+        another file) or an entity defined inside any file (``"User"``
+        to link to a class defined elsewhere). The lookup is name-based.
+        """
+        if isinstance(filepath, str):
+            filepath = Path(filepath)
+        if not filepath.is_absolute():
+            filepath = self.project_root / filepath
+        rel = filepath.relative_to(self.project_root).as_posix()
+
+        from_name = self._normalize_whitespace(str(from_name or ""), limit=160)
+        to_name = self._normalize_whitespace(str(to_name or ""), limit=160)
+        rel_type = self._normalize_whitespace(str(relation or ""), limit=40).lower()
+
+        if not from_name or not to_name:
+            return {"file": rel, "added": 0, "skipped": "empty_name"}
+        if rel_type not in _ALLOWED_RELATION_TYPES:
+            return {
+                "file": rel, "added": 0,
+                "skipped": f"unknown_relation_type:{rel_type}",
+                "allowed": sorted(_ALLOWED_RELATION_TYPES),
+            }
+
+        with sqlite3.connect(self.db_path) as con:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO relations(file, from_name, relation, to_name) VALUES(?,?,?,?)",
+                (rel, from_name, rel_type, to_name),
+            )
+            inserted = cur.rowcount  # 0 if duplicate, 1 if new
+
+        self._faiss_dirty = True
+        return {
+            "file": rel, "added": inserted,
+            "from": from_name, "relation": rel_type, "to": to_name,
+            "duplicate": inserted == 0,
+        }
+
+    @staticmethod
+    def get_schema() -> dict:
+        """Return the graph's validation schema — which entity types
+        and relation types are accepted by ``write_batch`` / ``add_entity``
+        / ``add_relation``. Single source of truth, queryable so
+        callers don't have to duplicate the lists in their prompts
+        or docstrings (which inevitably drift from this code).
+
+        Returns:
+            ``{"entity_types": sorted[str],
+               "relation_types": sorted[str]}``
+
+        Anything emitted with a type / relation outside these sets is
+        silently dropped by ``_sanitize_relations`` / sanitize-extracted.
+        """
+        return {
+            "entity_types": sorted(_ALLOWED_ENTITY_TYPES),
+            "relation_types": sorted(_ALLOWED_RELATION_TYPES),
+        }
+
+    def mark_stale(
+        self,
+        filepath: "Path | str",
+        cascade: bool = True,
+    ) -> dict:
+        """Flag a file (and optionally its dependents) as needing reindex.
+
+        Mechanics: sets ``file_meta.mtime`` to 0 so ``_file_needs_update``
+        compares 0 to disk-mtime, they differ, returns True. The next
+        ``graph_pending_files`` / ``graph_build`` / ``rag_rebuild
+        scope=stale`` query picks the file up.
+
+        Entities and relations are NOT deleted here — old data stays
+        queryable for ``graph_explain`` / ``graph_find_usages`` until
+        the actual reindex runs. The stale flag is purely a hint.
+
+        When ``cascade=True`` (default), also marks dependents stale —
+        every file whose graph edges target an entity defined in the
+        changed file. Rationale: if I rename a function in ``foo.py``,
+        the ``imports`` / ``calls`` edges from ``bar.py`` (which uses
+        that function) are now broken, even though ``bar.py``'s own
+        mtime didn't change. Without cascade, those edges stay stale
+        forever — the partial reindex of ``foo.py`` alone makes them
+        worse, not better.
+
+        Args:
+            filepath: Project-relative path of the changed file.
+            cascade: If True, also flag every file that depends on
+                ``filepath``'s entities via ``affected_files``.
+
+        Returns: ``{"marked": [<rel>, ...]}`` — list of all files
+            flagged (always includes the target itself).
+        """
+        if isinstance(filepath, str):
+            filepath = Path(filepath)
+        if not filepath.is_absolute():
+            filepath = self.project_root / filepath
+        try:
+            rel = filepath.relative_to(self.project_root).as_posix()
+        except ValueError:
+            return {"marked": [], "skipped": "outside_project_root"}
+
+        targets = {rel}
+        if cascade:
+            try:
+                affected = self.affected_files(filepath)
+                targets.update(affected.get("files", []))
+            except Exception as e:
+                # affected_files might fail if the file isn't in the
+                # graph yet (new file the agent just created) — that's
+                # fine, just skip cascade.
+                logger.debug("mark_stale: cascade skipped for %s: %s", rel, e)
+
+        marked: list[str] = []
+        with sqlite3.connect(self.db_path) as con:
+            for t in targets:
+                cur = con.execute(
+                    "UPDATE file_meta SET mtime = 0 WHERE file = ?", (t,),
+                )
+                if cur.rowcount > 0:
+                    marked.append(t)
+        return {"marked": sorted(marked)}
+
+    @staticmethod
+    def _import_candidates(rel: str) -> list[str]:
+        """All plausible ``to_name`` forms an importer might use for
+        the file at ``rel`` (project-relative, forward slashes).
+
+        Imports edges are stored as the module string as it appears
+        in source. That's a different shape for each language and
+        sometimes for each style:
+
+          Python ``from src.services.user import X``  → ``"src.services.user"``
+          Python ``import src.services.user``         → ``"src.services.user"``
+          TS    ``from "./services/user"``            → ``"./services/user"``
+          TS    ``from "../services/user.ts"``        → ``"../services/user.ts"``
+          File path itself (rare convention)          → ``"src/services/user.py"``
+
+        ``affected_files`` needs to match all of them. Build the candidate
+        set here in one place.
+        """
+        cands = {rel}
+
+        # Strip extension once if present.
+        if "." in rel.rsplit("/", 1)[-1]:
+            base = rel.rsplit(".", 1)[0]   # ``src/services/user.py`` → ``src/services/user``
+        else:
+            base = rel
+
+        # Path form without extension (TS convention).
+        cands.add(base)
+        cands.add(f"./{base}")
+        cands.add(f"./{base.rsplit('/', 1)[-1]}")  # ``./user``
+
+        # Python dotted form: drop trailing ``__init__`` and any
+        # common prefix variations.
+        py = base.replace("/", ".")
+        if py.endswith(".__init__"):
+            py = py[: -len(".__init__")]
+        cands.add(py)
+        # Also strip leading ``src.`` since many projects import without it.
+        if py.startswith("src."):
+            cands.add(py[4:])
+        # And without the top dir entirely (e.g. ``services.user``).
+        parts = py.split(".")
+        if len(parts) > 2:
+            cands.add(".".join(parts[1:]))
+            cands.add(".".join(parts[2:]))
+
+        return sorted(c for c in cands if c)
+
+    def affected_files(self, filepath: "Path | str") -> dict:
+        """Files whose graph entries depend on ``filepath``'s exports.
+
+        Returns the union of:
+          * files that ``import`` from this file (forward import edge),
+          * files that ``call`` / ``use`` / ``instantiate`` / ``inherit``
+            any entity defined in this file (reverse-resolution via the
+            entity name).
+
+        Used by RAG-builder sub-agents for incremental rebuilds: when
+        ``foo.py`` is modified, ``affected_files('foo.py')`` returns
+        ``bar.py``, ``baz.py``, etc. — the agent reindexes that set
+        instead of the whole project.
+
+        Args:
+            filepath: Relative or absolute path. The file itself is
+                always included in the result (since it changed).
+
+        Returns:
+            ``{"target": rel_path, "files": [<rel>, ...]}`` sorted.
+            Result includes the target file itself.
+        """
+        if isinstance(filepath, str):
+            filepath = Path(filepath)
+        if not filepath.is_absolute():
+            filepath = self.project_root / filepath
+        rel = filepath.relative_to(self.project_root).as_posix()
+
+        with sqlite3.connect(self.db_path) as con:
+            # Entity names defined in the target file.
+            target_names = {
+                row[0] for row in con.execute(
+                    "SELECT name FROM entities WHERE file = ?", (rel,)
+                ).fetchall()
+            }
+
+            affected: set[str] = {rel}
+
+            # Reverse-resolution: any file whose relations point at our
+            # target's exports (calls / uses / inherits / instantiates).
+            if target_names:
+                placeholders = ",".join("?" * len(target_names))
+                rows = con.execute(
+                    f"""SELECT DISTINCT file FROM relations
+                        WHERE to_name IN ({placeholders})
+                          AND relation IN ('calls','uses','inherits','instantiates')""",
+                    tuple(target_names),
+                ).fetchall()
+                affected.update(r[0] for r in rows)
+
+            # Forward import edge — files we import are not "affected" by
+            # OUR change (their entities didn't change), so we skip that
+            # direction. But files that import US obviously are.
+            #
+            # The trap: import edges are stored under the module string
+            # as it appears in source (``"src.services.user"`` Python,
+            # ``"./services/user"`` TS) — NOT the project-relative file
+            # path. Without ``_import_candidates`` this query would only
+            # match the rare convention where the importer emitted the
+            # raw path; standard Python / TS imports would silently
+            # never match → ``affected_files(foo.py) = [foo.py]`` only.
+            cands = self._import_candidates(rel)
+            placeholders = ",".join("?" * len(cands))
+            rows = con.execute(
+                f"SELECT DISTINCT file FROM relations "
+                f"WHERE to_name IN ({placeholders}) AND relation = 'imports'",
+                tuple(cands),
+            ).fetchall()
+            affected.update(r[0] for r in rows)
+
+        return {"target": rel, "files": sorted(affected)}
 
     def get_build_status(self) -> dict:
         files = self._get_files()
@@ -1490,8 +2230,17 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             "missing": missing,
         }
 
-    async def build(self, max_files: Optional[int] = None) -> dict:
-        """Index every stale file by default. Pass ``max_files`` to cap one call."""
+    async def build(
+        self, max_files: Optional[int] = None, force_llm: bool = False
+    ) -> dict:
+        """Index every stale file by default. Pass ``max_files`` to cap one call.
+
+        ``force_llm=True`` routes every file through the LLM extractor instead
+        of tree-sitter / structured parsers, AND re-indexes files that aren't
+        stale — useful when tree-sitter mis-parsed a previous build or when
+        you need semantic extraction across the board. Expensive: every file
+        becomes one LLM call. Cap with ``max_files`` to keep cost predictable.
+        """
         self._is_building = True
         try:
             t0 = time.time()
@@ -1499,17 +2248,22 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             t1 = time.time()
             logger.info("Graph file scan: %d files in %.2fs", len(files), t1 - t0)
             deleted_files = self._cleanup_deleted_files(files)
-            stale = [f for f in files if self._file_needs_update(f)]
+            if force_llm:
+                # Re-index everything, not just stale — caller asked for an
+                # LLM pass and probably wants existing tree-sitter rows replaced.
+                stale = list(files)
+            else:
+                stale = [f for f in files if self._file_needs_update(f)]
             to_update = stale if max_files is None else stale[:max_files]
             remaining = max(0, len(stale) - len(to_update))
-            logger.info("Graph build: %d/%d files need indexing (%d remaining)",
-                        len(to_update), len(files), remaining)
+            logger.info("Graph build: %d/%d files need indexing (%d remaining, force_llm=%s)",
+                        len(to_update), len(files), remaining, force_llm)
 
             sem = asyncio.Semaphore(5)
 
             async def _index_with_sem(f: Path) -> None:
                 async with sem:
-                    await self.index_file(f)
+                    await self.index_file(f, force_llm=force_llm)
 
             await asyncio.gather(*[_index_with_sem(f) for f in to_update])
 
@@ -1986,6 +2740,22 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         results = results[:limit]
         if results or entity_type:
             return results
+        # LIKE found nothing — try FAISS-only as a fallback for natural-language
+        # queries that don't match any entity name (e.g. Russian questions).
+        if self.faiss_index is not None and self.faiss_names:
+            try:
+                q_vec = encode_query([query], normalize_embeddings=True,
+                                     show_progress_bar=False).astype("float32")
+                k = min(limit, self.faiss_index.ntotal)
+                scores, indices = self.faiss_index.search(q_vec, k)
+                faiss_names = [self.faiss_names[i] for s, i in zip(scores[0], indices[0])
+                               if i >= 0 and s > 0.1][:limit]
+                if faiss_names:
+                    results = self.search_entity(" ".join(faiss_names), entity_type=entity_type, limit=limit)
+                    if results:
+                        return results
+            except Exception as e:
+                logger.warning("FAISS fallback search failed: %s", e)
         return self._search_raw_occurrences(query, limit=limit)
 
     def get_subgraph(
