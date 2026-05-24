@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _ALLOWED_ENTITY_TYPES = {
     "class", "function", "method", "import", "module", "interface", "component",
     "hook", "type", "enum", "selector", "style", "template", "config", "variable", "symbol", "property",
+    "constant",
     # Framework-specific (Angular / NestJS / React hooks)
     "service", "directive", "pipe", "controller",
     # HTTP/WS routes — same URL path string on frontend (consumer) and
@@ -1641,6 +1642,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                         e.get("snippet", ""),
                         traits,
                     ),
+                )
+                # Auto-emit ``file --defines--> entity`` — the same trivial
+                # edge add_entity emits. Without it this write path produced
+                # no defines edges at all (callers are told not to pass them),
+                # leaving file-structure / repo-map / dead-code analyses blind.
+                con.execute(
+                    "INSERT OR IGNORE INTO relations(file, from_name, relation, to_name) VALUES(?,?,?,?)",
+                    (rel_path, rel_path, "defines", e.get("name", "")),
                 )
             for r in data.get("relations", []):
                 con.execute(
