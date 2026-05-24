@@ -2598,15 +2598,25 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         tree_sitter_result = self._find_entity_with_tree_sitter(path, entity_name, lines)
         if tree_sitter_result["line_start"] is not None:
             return tree_sitter_result
+        # Priority-ordered: scan ALL lines for a real definition form
+        # (def/class/function/const/...) before falling back to a bare
+        # textual mention. A line-by-line loop that breaks on the first
+        # match of ANY pattern lets a comment merely mentioning the name
+        # (e.g. line 43) shadow the actual `def` further down (line 121).
+        # So loop patterns in the OUTER position: the weakest pattern
+        # (bare name) is only consulted if no definition form exists.
         patterns = [
             f"def {entity_name}",
             f"class {entity_name}",
             f"function {entity_name}",
+            f"const {entity_name}",
+            f"let {entity_name}",
+            f"var {entity_name}",
             entity_name,
         ]
         match_index = None
-        for idx, line in enumerate(lines):
-            for pattern in patterns:
+        for pattern in patterns:
+            for idx, line in enumerate(lines):
                 if pattern in line:
                     match_index = idx
                     break
@@ -2614,10 +2624,12 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 break
         if match_index is None:
             return {"line_start": None, "line_end": None, "snippet": ""}
+        # Anchor line_start to the matched definition line itself; keep a
+        # couple of leading lines only for snippet context.
         start = max(0, match_index - 2)
         end = min(len(lines), match_index + 3)
         snippet = "\n".join(lines[start:end]).strip()
-        return {"line_start": start + 1, "line_end": end, "snippet": snippet}
+        return {"line_start": match_index + 1, "line_end": end, "snippet": snippet}
 
     def _search_raw_occurrences(self, query: str, limit: int = 10) -> list[dict]:
         normalized = query.strip()
