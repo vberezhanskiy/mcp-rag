@@ -771,6 +771,12 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         raw_relations = data.get("relations", []) if isinstance(data, dict) else []
         entities = self._enrich_entity_locations(rel_path, [e for e in raw_entities if isinstance(e, dict)])
         entity_names = {entity["name"] for entity in entities}
+        # The file's own module-entity (its relpath) is an implicit, always-valid
+        # endpoint: RAG-builder emits module-level edges (imports/calls) with
+        # from_name = rel_path. Without seeding it here, _sanitize_relations would
+        # drop every such edge (neither endpoint in the batch's entity set),
+        # leaving files as "N entities, 0 relations".
+        entity_names.add(rel_path)
         relations = self._sanitize_relations(rel_path, [r for r in raw_relations if isinstance(r, dict)], entity_names)
         return {"entities": entities, "relations": relations}
 
@@ -1806,7 +1812,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 rel, len(relations),
             )
 
-        raw = {"entities": entities or [], "relations": relations or []}
+        raw_entities = list(entities or [])
+        # Ensure the file's own module-entity exists as a graph node, so the
+        # module-level import/call edges (from_name = rel_path) point at a real
+        # node — mirrors what the tree-sitter path does via _make_file_entity.
+        # Only for full-file writes (entities present); additive reverse-grep
+        # writes (entities=[]) must not resurrect a wiped file node.
+        if entities and not any(e.get("name") == rel for e in raw_entities if isinstance(e, dict)):
+            raw_entities.append(self._make_file_entity(rel, "module", "Module file"))
+        raw = {"entities": raw_entities, "relations": relations or []}
         data = self._sanitize_extracted(rel, raw)
         self._store_extracted(rel, mtime, data)
 
