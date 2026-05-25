@@ -1418,16 +1418,22 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             picked = [p for p in items if flt in p.lower()] if flt else items
             return picked[:limit]
 
+        needs_incoming_all = pending.get("needs_incoming", [])
         unindexed = pick(pending["unindexed"])
         stale = pick(pending["stale"])
         missing = pick(pending["missing"])
-        total = len(pending["unindexed"]) + len(pending["stale"]) + len(pending["missing"])
+        needs_incoming = pick(needs_incoming_all)
+        total = (
+            len(pending["unindexed"]) + len(pending["stale"])
+            + len(pending["missing"]) + len(needs_incoming_all)
+        )
         if total == 0:
             return "Graph is fully in sync with disk."
 
         lines = [
             f"Pending vs disk — unindexed={len(pending['unindexed'])}, "
-            f"stale={len(pending['stale'])}, missing={len(pending['missing'])}"
+            f"stale={len(pending['stale'])}, missing={len(pending['missing'])}, "
+            f"needs_incoming={len(needs_incoming_all)}"
         ]
         if flt:
             lines[0] += f"  (filter={flt!r})"
@@ -1435,6 +1441,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
             ("Unindexed (never built)", unindexed, pending["unindexed"]),
             ("Stale (mtime changed)", stale, pending["stale"]),
             ("Missing (gone from disk)", missing, pending["missing"]),
+            ("Needs-incoming (reverse-grep not done)", needs_incoming, needs_incoming_all),
         ):
             if not items:
                 continue

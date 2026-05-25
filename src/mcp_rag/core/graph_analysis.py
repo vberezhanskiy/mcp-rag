@@ -428,9 +428,14 @@ class GraphAnalysisMixin:
                 "SELECT file, name, type, line_start FROM entities "
                 "WHERE type IN ('function', 'method', 'class', 'component', 'interface')"
             ).fetchall()
+            # ``imports`` is included alongside the call/use edges: a test that
+            # imports a production symbol by name exercises it, and is a valid
+            # coverage signal. Tests commonly record the dependency as
+            # ``imports src.pkg.mod.Symbol`` (a dotted path) rather than a bare
+            # ``calls Symbol`` — both forms are resolved below.
             rel_rows = con.execute(
                 "SELECT file, from_name, relation, to_name FROM relations "
-                "WHERE relation IN ('calls', 'uses', 'instantiates')"
+                "WHERE relation IN ('calls', 'uses', 'instantiates', 'imports')"
             ).fetchall()
 
         test_files = {f[0] for f in file_rows if self._is_test_path(f[0], globs)}
@@ -439,7 +444,15 @@ class GraphAnalysisMixin:
         coverage: dict[str, set[tuple[str, str]]] = defaultdict(set)
         for src_file, src_name, _rel, target in rel_rows:
             if src_file in test_files:
+                # Match both the raw target and its bare leaf (last dotted
+                # segment), so ``imports src.models.enums.ChatMode`` covers the
+                # production entity named ``ChatMode``. Leaf keys that don't
+                # match any production entity name are simply never looked up,
+                # so this cannot inflate the covered count with phantoms.
                 coverage[target].add((src_file, src_name))
+                leaf = target.rsplit(".", 1)[-1]
+                if leaf and leaf != target:
+                    coverage[leaf].add((src_file, src_name))
 
         prod_entities = [
             {"file": f, "name": n, "type": t, "line_start": ls}

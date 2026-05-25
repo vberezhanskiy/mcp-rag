@@ -607,7 +607,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 CREATE TABLE IF NOT EXISTS file_meta (
                     file    TEXT PRIMARY KEY,
                     mtime   REAL NOT NULL,
-                    indexed INTEGER DEFAULT 1
+                    indexed INTEGER DEFAULT 1,
+                    incoming_done INTEGER DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
                 CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_name);
@@ -621,6 +622,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     PRIMARY KEY (hash, model)
                 );
             """)
+            fm_columns = {row[1] for row in con.execute("PRAGMA table_info(file_meta)").fetchall()}
+            if "incoming_done" not in fm_columns:
+                # Legacy DBs: add the reverse-grep completion flag. Default 1
+                # so already-indexed files aren't retroactively flagged as
+                # "needs incoming edges" — the gate only bites files written
+                # after this migration.
+                con.execute("ALTER TABLE file_meta ADD COLUMN incoming_done INTEGER DEFAULT 1")
             columns = {row[1] for row in con.execute("PRAGMA table_info(entities)").fetchall()}
             if "line_start" not in columns:
                 con.execute("ALTER TABLE entities ADD COLUMN line_start INTEGER")
@@ -1614,7 +1622,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         logger.info("rebackfill_traits: tagged %d / %d entities.", updated, len(rows))
         return updated
 
-    def _store_extracted(self, rel_path: str, mtime: float, data: dict) -> None:
+    def _store_extracted(self, rel_path: str, mtime: float, data: dict, incoming_done: int = 1) -> None:
         with sqlite3.connect(self.db_path) as con:
             for e in data.get("entities", []):
                 traits = self._detect_traits(
@@ -1657,8 +1665,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     (rel_path, r.get("from", ""), r.get("relation", ""), r.get("to", "")),
                 )
             con.execute(
-                "INSERT OR REPLACE INTO file_meta(file, mtime, indexed) VALUES(?,?,1)",
-                (rel_path, mtime),
+                "INSERT OR REPLACE INTO file_meta(file, mtime, indexed, incoming_done) VALUES(?,?,1,?)",
+                (rel_path, mtime, int(incoming_done)),
             )
 
     def _mark_file_seen(self, rel: str, mtime: float) -> None:
@@ -1728,6 +1736,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         entities: list[dict],
         relations: list[dict],
         rebuild_faiss: bool = False,
+        incoming_complete: bool = False,
     ) -> dict:
         """Direct graph write — bypasses tree-sitter / LLM extractor pipeline.
 
@@ -1812,13 +1821,18 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # destroy the file's previously-indexed entities. So only wipe
         # when entities are present, or when both lists are empty
         # (explicit full clear of this file).
-        if entities or not relations:
+        # An additive reverse-grep / completion write carries no entities
+        # (it only adds incoming edges to an already-indexed file, or just
+        # flips the completion flag). Such a call must NOT wipe the file —
+        # even when it carries zero relations (``incoming_complete=True`` with
+        # nothing found). Only wipe for full-file writes (entities present).
+        if entities or (not relations and not incoming_complete):
             self._delete_file_data(rel)
         else:
             logger.info(
-                "write_batch: %s called with entities=[] and %d relations "
-                "— treating as additive reverse-grep write, skipping wipe",
-                rel, len(relations),
+                "write_batch: %s called with entities=[] (relations=%d, "
+                "incoming_complete=%s) — additive reverse-grep write, skipping wipe",
+                rel, len(relations or []), incoming_complete,
             )
 
         raw_entities = list(entities or [])
@@ -1831,7 +1845,20 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             raw_entities.append(self._make_file_entity(rel, "module", "Module file"))
         raw = {"entities": raw_entities, "relations": relations or []}
         data = self._sanitize_extracted(rel, raw)
-        self._store_extracted(rel, mtime, data)
+
+        # ── Per-file reverse-grep gate ──────────────────────────────────────
+        # A full-file write of a CODE file is NOT considered finished until
+        # its INCOMING edges have been grepped in: store it with
+        # incoming_done=0 so ``get_pending_files`` keeps reporting it under
+        # ``needs_incoming`` and the sub-agent is forced to come back with a
+        # reverse-grep write. A completion write (entities=[], the model has
+        # done the grep) or any non-code / additive write clears the flag.
+        code_ext = filepath.suffix.lower() in _CODE_EXTS
+        if entities and code_ext and not incoming_complete:
+            incoming_done = 0
+        else:
+            incoming_done = 1
+        self._store_extracted(rel, mtime, data, incoming_done=incoming_done)
 
         if rebuild_faiss:
             self._rebuild_faiss()
@@ -1841,11 +1868,31 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             # then ``search_code`` will see the old vector set.
             self._faiss_dirty = True
 
-        return {
+        result = {
             "file": rel,
             "entities": len(data["entities"]),
             "relations": len(data["relations"]),
         }
+        # Hand the model an explicit, per-file next action so the gate is
+        # self-documenting: it learns the reverse-grep protocol from the tool
+        # response itself, not just the system prompt.
+        if incoming_done == 0:
+            def_names = [
+                e.get("name", "")
+                for e in data["entities"]
+                if isinstance(e, dict) and e.get("name") and e.get("name") != rel
+            ]
+            result["needs_incoming"] = True
+            result["grep_names"] = def_names
+            result["next_action"] = (
+                f"NOT DONE with {rel}: now grep these definitions project-wide and "
+                f"record their INCOMING edges (who calls/uses/instantiates them), then "
+                f"submit graph_write_batch('{rel}', entities=[], relations=[...found...], "
+                f"incoming_complete=True). If a name has no external references, still "
+                f"send the completion write with incoming_complete=True. Names: "
+                + ", ".join(def_names)
+            )
+        return result
 
     def rebuild_faiss(self) -> None:
         """Public alias for the FAISS reindex — called by RAG-builder
@@ -2194,6 +2241,26 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 ).fetchall()
                 affected.update(r[0] for r in rows)
 
+                # Dotted-target resolution: cross-file references are often
+                # recorded as ``imports src.pkg.mod.Symbol`` / ``calls
+                # pkg.mod.func`` (dotted path) rather than the bare name, so
+                # the exact-match query above misses them and dependents are
+                # under-reported. Match any relation whose to_name's leaf
+                # segment equals one of our defined names. Slight
+                # over-inclusion (a same-named symbol elsewhere) is safe for
+                # incremental rebuild — under-inclusion is the real bug.
+                like_clauses = " OR ".join(
+                    "to_name LIKE ? ESCAPE '\\'" for _ in target_names
+                )
+                like_params = [self._dotted_leaf_like(n) for n in target_names]
+                rows = con.execute(
+                    f"""SELECT DISTINCT file FROM relations
+                        WHERE ({like_clauses})
+                          AND relation IN ('imports','calls','uses','inherits','instantiates')""",
+                    tuple(like_params),
+                ).fetchall()
+                affected.update(r[0] for r in rows)
+
             # Forward import edge — files we import are not "affected" by
             # OUR change (their entities didn't change), so we skip that
             # direction. But files that import US obviously are.
@@ -2238,19 +2305,32 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         indexed = set(self._get_files_indexed())
         existing = {p.relative_to(self.project_root).as_posix(): p for p in files}
 
+        # Files indexed but still awaiting their incoming (reverse-grep) edges.
+        with sqlite3.connect(self.db_path) as con:
+            needs_incoming_set = {
+                r[0]
+                for r in con.execute(
+                    "SELECT file FROM file_meta WHERE indexed = 1 AND incoming_done = 0"
+                ).fetchall()
+            }
+
         unindexed: list[str] = []
         stale: list[str] = []
+        needs_incoming: list[str] = []
         for rel, path in existing.items():
             if rel not in indexed:
                 unindexed.append(rel)
             elif self._file_needs_update(path):
                 stale.append(rel)
+            elif rel in needs_incoming_set:
+                needs_incoming.append(rel)
 
         missing = sorted(indexed - set(existing.keys()))
         return {
             "unindexed": sorted(unindexed),
             "stale": sorted(stale),
             "missing": missing,
+            "needs_incoming": sorted(needs_incoming),
         }
 
     async def build(
@@ -2457,11 +2537,25 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             self.faiss_names = []
             logger.warning("FAISS rebuild failed: %s", e)
 
+    @staticmethod
+    def _dotted_leaf_like(name: str) -> str:
+        # LIKE pattern matching any dotted target whose final segment == name
+        # (e.g. ``src.database.get_db`` for name ``get_db``). ``_`` and ``%``
+        # are LIKE wildcards and must be escaped — entity names routinely
+        # contain underscores.
+        escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%.{escaped}"
+
     def find_usages(self, name: str) -> list[dict]:
+        # Match both the bare ``to_name`` and dotted import targets whose leaf
+        # segment equals ``name`` — many builders record cross-file references
+        # as ``imports pkg.mod.Name`` rather than ``calls Name``.
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute(
-                "SELECT file, from_name, relation, to_name FROM relations WHERE to_name = ? ORDER BY file, from_name, relation",
-                (name,),
+                "SELECT file, from_name, relation, to_name FROM relations "
+                "WHERE to_name = ? OR to_name LIKE ? ESCAPE '\\' "
+                "ORDER BY file, from_name, relation",
+                (name, self._dotted_leaf_like(name)),
             ).fetchall()
         return [{"file": r[0], "from": r[1], "relation": r[2], "to": r[3]} for r in rows]
 
@@ -2476,8 +2570,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     def get_callers(self, function_name: str) -> list[dict]:
         with sqlite3.connect(self.db_path) as con:
             rows = con.execute(
-                "SELECT file, from_name FROM relations WHERE to_name = ? AND relation = 'calls' ORDER BY file, from_name",
-                (function_name,),
+                "SELECT file, from_name FROM relations "
+                "WHERE (to_name = ? OR to_name LIKE ? ESCAPE '\\') AND relation = 'calls' "
+                "ORDER BY file, from_name",
+                (function_name, self._dotted_leaf_like(function_name)),
             ).fetchall()
         return [{"file": r[0], "caller": r[1]} for r in rows]
 

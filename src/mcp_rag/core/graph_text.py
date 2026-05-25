@@ -190,10 +190,25 @@ class GraphTextMixin:
         calls regardless of argument shape. Requires ``ast-grep`` (or
         ``sg``) on PATH.
         """
+        import os
         import shutil
         import subprocess
+        import sys
 
         binary = shutil.which("ast-grep") or shutil.which("sg")
+        if not binary:
+            # Fallback: the CLI is often pip-installed (``ast-grep-cli``) into
+            # the interpreter's Scripts/bin dir, which isn't always on the
+            # worker process PATH. Look right next to sys.executable.
+            exe_dir = os.path.dirname(sys.executable)
+            for cand in ("ast-grep", "sg"):
+                for fname in (cand, cand + ".exe"):
+                    p = os.path.join(exe_dir, fname)
+                    if os.path.isfile(p):
+                        binary = p
+                        break
+                if binary:
+                    break
         if not binary:
             return {
                 "matches": [],
