@@ -97,9 +97,10 @@ def _build_tools() -> list[Tool]:
             name="graph_build",
             description=(
                 "Build or refresh the per-project code knowledge graph. "
-                "Walks source via tree-sitter / regex extractors and stores "
-                "entities + relations in SQLite + FAISS. By default indexes "
-                "every stale file in one call. "
+                "Walks source via the LLM extractor (plus regex parsers for "
+                "stylesheets, configs, and templates) and stores entities + "
+                "relations in SQLite + FAISS. By default indexes every stale "
+                "file in one call. "
                 "Auto-runs on the first data-needing graph_* tool when the "
                 "graph is empty, so you usually don't call this directly — "
                 "only after large branch switches, after changing extractor "
@@ -120,7 +121,7 @@ def _build_tools() -> list[Tool]:
                     "force_llm": {
                         "type": "boolean",
                         "default": False,
-                        "description": "Force every file through the LLM extractor instead of tree-sitter / regex parsers, AND re-index even non-stale files. Use when tree-sitter mis-parses your dialect (wrong entity types / phantom names in graph_stats), or to fill gaps for languages the deterministic extractors can't handle well. Expensive — one LLM call per file — so pair with ``max_files`` for predictable cost. Requires an LLM extractor configured via MCP_RAG_LLM_* env; otherwise files come back empty.",
+                        "description": "Re-index every file through the LLM extractor even if it isn't stale. Use for a full semantic refresh. Expensive — one LLM call per file — so pair with ``max_files`` for predictable cost. Requires an LLM extractor configured via MCP_RAG_LLM_* env; otherwise files come back empty.",
                     },
                 },
             },
@@ -141,7 +142,7 @@ def _build_tools() -> list[Tool]:
                     "force_llm": {
                         "type": "boolean",
                         "default": False,
-                        "description": "Skip tree-sitter / structured extractors and run the LLM extractor directly on this file. Use when tree-sitter produced wrong/incomplete results for this specific file (mixed dialect, embedded DSL, unusual syntax). Requires an LLM extractor configured via MCP_RAG_LLM_* env.",
+                        "description": "Re-index the file through the LLM extractor even if it isn't stale. Useful when the previous extraction produced wrong or incomplete results for this specific file. Requires an LLM extractor configured via MCP_RAG_LLM_* env.",
                     },
                 },
                 "required": ["filepath"],
@@ -150,9 +151,8 @@ def _build_tools() -> list[Tool]:
         Tool(
             name="graph_write_batch",
             description=(
-                "Direct entity/relation write — bypasses tree-sitter and the "
-                "LLM-fallback extractor. Use this when YOU (the calling agent) "
-                "have already extracted the graph for a file via your own "
+                "Direct entity/relation write — bypasses the LLM extractor. "
+                "Use this when YOU (the calling agent) have already extracted "
                 "reasoning over its content, and you want to persist the "
                 "result without re-running mcp-rag's own extraction.\n\n"
                 "Typical caller: a RAG-builder sub-agent that reads source "
@@ -263,10 +263,10 @@ def _build_tools() -> list[Tool]:
                 "the corresponding file-entity that mcp-rag auto-creates "
                 "for every indexed file).\n\n"
                 "Typical use: a RAG-builder sub-agent that has run "
-                "``graph_index_file`` (tree-sitter) on a file, then reads "
-                "the source and adds the cross-file ``uses`` edges that "
-                "tree-sitter missed — e.g. ``write_cover_active uses "
-                "cover_active.h`` for a Path.write_text() pattern."
+                "``graph_index_file`` on a file, then reads the source and "
+                "adds the cross-file ``uses`` edges that the extractor missed "
+                "— e.g. ``write_cover_active uses cover_active.h`` for a "
+                "Path.write_text() pattern."
             ),
             inputSchema={
                 "type": "object",
@@ -1932,10 +1932,10 @@ def _render_file(services: Services, path: str) -> str:
     info = services.graph.explain_file(rel, top_callers=5)
     if not info["entities"] and not info["deps"]:
         return f"# {rel}\n\nNot in graph. Did you run `graph_build`?"
-    # Filter to "real" definitions — regex sweep records every `name(` form as
-    # a "function" call target with description "Referenced call target", which
-    # buries actual class/function declarations from tree-sitter (those have
-    # "Extracted from <node>" descriptions or originate from structured parsers).
+    # Filter to "real" definitions — the regex sweep in _extract_symbol_relations
+    # records every `name(` form as a "function" call target with description
+    # "Referenced call target", which buries actual class/function declarations
+    # from the LLM extractor (those have semantic descriptions).
     primary_types = {"class", "function", "method", "component", "interface", "enum", "type", "module"}
     primary = [
         e for e in info["entities"]

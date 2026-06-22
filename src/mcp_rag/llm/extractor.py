@@ -1,8 +1,8 @@
-"""LLM-based fallback extractor for languages tree-sitter doesn't cover.
+"""LLM-based entity/relation extractor for source files.
 
-Default is `NoOpExtractor` — returns nothing, so the graph relies on
-tree-sitter + regex parsers only. Plug in `OpenAICompatExtractor` to
-enable LLM extraction for arbitrary file types.
+Default is `NoOpExtractor` — returns nothing. Plug in
+`OpenAICompatExtractor` (or any subclass) to enable real extraction: every
+source file becomes one chat-completion call that returns a JSON graph.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class LLMExtractor(Protocol):
 
 
 class NoOpExtractor:
-    """Default — returns empty extraction. tree-sitter + regex carry the load."""
+    """Default — returns empty extraction. Plug in a real extractor to build graphs."""
 
     async def extract(self, rel_path: str, code: str) -> dict:  # noqa: ARG002
         return {"entities": [], "relations": []}

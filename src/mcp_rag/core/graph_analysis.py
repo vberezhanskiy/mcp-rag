@@ -214,7 +214,7 @@ class GraphAnalysisMixin:
           * Public methods declared in ``*.component.ts`` / ``*.pipe.ts`` /
             ``*.guard.ts`` / ``*.interceptor.ts`` / ``*.resolver.ts`` /
             ``*.directive.ts`` files — almost always wired by templates or DI
-            tokens, which tree-sitter doesn't traverse.
+            tokens, which the extractor doesn't surface as call edges.
         Set to False to see the raw graph results (useful when auditing
         backend-only repos, or after the template scanner has been enriched).
         """
@@ -574,7 +574,7 @@ class GraphAnalysisMixin:
             # that uses them.
             # Prefer entities with a `defines` edge (cleanest dedup).
             # Fall back to raw entity list when the graph was built via
-            # tree-sitter / manual write_batch (neither creates `defines`).
+            # manual write_batch (which skips the `defines` self-edge).
             ent_rows = con.execute(
                 "SELECT e.file, e.name, e.type, e.line_start, e.line_end, e.snippet, e.description "
                 "FROM entities e "

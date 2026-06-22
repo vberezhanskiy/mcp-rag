@@ -1,9 +1,11 @@
-"""Code Knowledge Graph — tree-sitter + regex extraction, SQLite storage.
+"""Code Knowledge Graph — LLM extraction, SQLite storage.
 
 Builds a per-project graph of entities (classes, functions, methods, imports,
 modules, components, …) and relations (defines, calls, imports, inherits,
-uses, instantiates). Falls back to an injectable LLM extractor for files
-that neither tree-sitter nor regex parsers can handle.
+uses, instantiates). Extraction is driven by an injectable LLM extractor
+(defaults to NoOpExtractor; plug in OpenAICompatExtractor for real graphs).
+Regex extractors cover stylesheets, config files, and HTML/Vue/Svelte
+templates where a structural scan is enough.
 """
 
 from __future__ import annotations
@@ -47,187 +49,6 @@ _ALLOWED_ENTITY_TYPES = {
 _ALLOWED_RELATION_TYPES = {
     "defines", "calls", "imports", "inherits", "uses", "instantiates",
 }
-
-_TREE_SITTER_LANGUAGES = {
-    # ── Mainstream ─────────────────────────────────────────────────────
-    ".py": "python",
-    ".pyi": "python",
-    ".js": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".mts": "typescript",
-    ".cts": "typescript",
-    ".tsx": "tsx",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".scala": "scala",
-    ".sc": "scala",
-    ".go": "go",
-    ".rs": "rust",
-    # NB: `.cs` parser ('csharp') is built against grammar v15 but tree-sitter
-    # 0.23.x ABI only supports v13-v14 — so C# silently falls back to LLM
-    # extraction until language-pack ships a v14 grammar. Keep the entry so
-    # it activates automatically on future pack/tree-sitter upgrades.
-    ".cs": "csharp",
-    ".php": "php",
-    ".phtml": "php",
-    ".rb": "ruby",
-    ".pl": "perl",
-    ".pm": "perl",
-    # ── Systems / native ───────────────────────────────────────────────
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".c++": "cpp",
-    ".hpp": "cpp",
-    ".hh": "cpp",
-    ".hxx": "cpp",
-    ".m": "objc",
-    ".d": "d",
-    ".zig": "zig",
-    # ── JVM-adjacent ───────────────────────────────────────────────────
-    ".groovy": "groovy",
-    ".gradle": "groovy",
-    ".clj": "clojure",
-    ".cljs": "clojure",
-    ".cljc": "clojure",
-    ".edn": "clojure",
-    # ── Functional ─────────────────────────────────────────────────────
-    ".ex": "elixir",
-    ".exs": "elixir",
-    ".erl": "erlang",
-    ".hrl": "erlang",
-    ".hs": "haskell",
-    ".lhs": "haskell",
-    # ── Scripting / dynamic ────────────────────────────────────────────
-    ".lua": "lua",
-    ".jl": "julia",
-    ".r": "r",
-    ".R": "r",
-    ".dart": "dart",
-    # ── Shell ──────────────────────────────────────────────────────────
-    ".sh": "bash",
-    ".bash": "bash",
-    ".zsh": "bash",
-    ".fish": "fish",
-    ".ps1": "powershell",
-    ".psm1": "powershell",
-    ".psd1": "powershell",
-    # ── Web3 ───────────────────────────────────────────────────────────
-    ".sol": "solidity",
-    # ── Infrastructure as code ─────────────────────────────────────────
-    ".tf": "terraform",
-    ".tfvars": "terraform",
-    ".hcl": "hcl",
-    ".nix": "nix",
-    # ── Data / schema ──────────────────────────────────────────────────
-    # NB: .sql grammar same v15 incompatibility as csharp until pack upgrade.
-    ".sql": "sql",
-    ".prisma": "prisma",
-    # ── Docs ───────────────────────────────────────────────────────────
-    ".md": "markdown",
-    ".markdown": "markdown",
-    ".tex": "latex",
-    ".rst": "rst",
-    # ── Hardware / scientific ──────────────────────────────────────────
-    ".v": "verilog",
-    ".sv": "verilog",
-    ".vhdl": "vhdl",
-    ".vhd": "vhdl",
-    ".f": "fortran",
-    ".f90": "fortran",
-    ".f95": "fortran",
-    # ── Game / scripting ───────────────────────────────────────────────
-    ".gd": "gdscript",
-    # ── Assembly ───────────────────────────────────────────────────────
-    ".asm": "asm",
-    ".s": "asm",
-    ".inc": "asm",
-}
-
-# NB: HTML/CSS/SCSS/LESS не добавляем сюда — `_extractor_strategy` ниже
-# отдаёт их специализированным `_extract_stylesheet` / `_extract_template`
-# (selectors, CSS vars, Angular component bindings) ДО tree-sitter, и они
-# точнее. Tree-sitter html/css парсеры доступны, но overrride'нуть стратегию
-# смысла мало — current extractors уже работают хорошо.
-
-_TREE_SITTER_NODE_TYPES = {
-    # Generic class / function / method
-    "class_definition",
-    "class_declaration",
-    "function_definition",
-    "function_declaration",
-    "function_signature",  # Dart
-    "method_definition",
-    "method_declaration",
-    "generator_function_declaration",
-    "local_function",  # Lua
-    # Variables / fields
-    "lexical_declaration",
-    "variable_declaration",
-    "public_field_definition",
-    "field_definition",
-    "pair",
-    "pair_pattern",
-    # Types / interfaces
-    "interface_declaration",
-    "type_alias_declaration",
-    "enum_declaration",
-    "abstract_class_declaration",
-    "trait_definition",        # Scala
-    "object_definition",        # Scala
-    "object_declaration",       # Kotlin
-    "mixin_declaration",        # Dart
-    "data_type",                # Haskell
-    # Rust
-    "struct_item",
-    "enum_item",
-    "function_item",
-    "impl_item",
-    "trait_item",
-    "mod_item",
-    "type_item",
-    # Go
-    "type_declaration",
-    "type_spec",
-    # Solidity
-    "contract_declaration",
-    "library_declaration",
-    # Verilog / VHDL
-    "module_declaration",
-    "package_declaration",
-    "entity_declaration",
-    "architecture_body",
-    # Fortran
-    "subroutine",
-    "subroutine_subprogram",
-    "function_subprogram",
-    "module_subprogram",
-    "program_block",
-    # Julia
-    "struct_definition",
-    "module_definition",
-    "abstract_definition",
-    # Markdown
-    "atx_heading",
-    "setext_heading",
-    # HTML / CSS (used by stylesheet/template extractors)
-    "element",
-    "script_element",
-    "style_element",
-    "stylesheet",
-    "rule_set",
-    "qualified_rule",
-    "class_selector",
-    "id_selector",
-}
-
-_TREE_SITTER_NAME_FIELDS = ("name", "declarator", "property", "left")
 
 _CODE_EXTENSIONS = [
     "*.py", "*.pyi",
@@ -274,17 +95,16 @@ _IGNORE_DIRS = {
 }
 
 # Files larger than this are skipped — typically minified bundles, lockfiles,
-# generated SQL dumps, ML weights. Tree-sitter and regex extractors can hang
-# or balloon memory on multi-MB inputs.
+# generated SQL dumps, ML weights. LLM and regex extractors can hang or
+# balloon memory on multi-MB inputs.
 _MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
 # ── Angular template expression scanning ─────────────────────────────────────
-# Tree-sitter has no HTML extractor wired up, so methods invoked only from
-# templates (.html plus inline `template:` strings) were invisible to the call
-# graph — and graph_dead_code flagged every (click)-bound method as orphan.
-# These regexes power _extract_template's binding scan; kept module-level so
-# they compile once. Coverage:
+# Methods invoked only from templates (.html plus inline `template:` strings)
+# were invisible to the call graph — and graph_dead_code flagged every
+# (click)-bound method as orphan. These regexes power _extract_template's
+# binding scan; kept module-level so they compile once. Coverage:
 #   - Event/property/two-way bindings:    (click)="save()"  [disabled]="x"  [(ngModel)]="y"
 #   - Structural directives (legacy):     *ngIf="ready"  *ngFor="let u of users()"
 #   - Interpolation:                      {{ user.fullName() }}
@@ -798,14 +618,11 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return "config"
         if suffix in {".html", ".htm", ".vue", ".svelte", ".astro"}:
             return "template"
-        # Tree-sitter extraction is intentionally disabled: its output was
-        # shallow (entity name + a generic "Extracted from <node_type>"
-        # description) and the regex-based call/uses relation scanner produced
-        # noisy phantom edges to keywords/builtins. The LLM extractor yields
-        # real semantic descriptions and accurate relations, so every source
-        # language now routes through it. Tree-sitter is still kept for the
-        # entity *location* lookup (_find_entity_with_tree_sitter), which only
-        # needs the AST to anchor line_start/line_end — not for extraction.
+        # Source code (.py/.ts/.go/.rs/…/everything else) routes through the
+        # LLM extractor — semantic descriptions and accurate call/uses edges
+        # beat tree-sitter's shallow "Extracted from <node_type>" labels.
+        # Tree-sitter was fully removed in this revision; the regex scanner
+        # in _find_entity_snippet handles entity line lookup.
         return "llm"
 
     @staticmethod
@@ -982,571 +799,6 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return {"entities": [], "relations": []}
 
     @staticmethod
-    def _infer_tree_sitter_entity_type(node_type: str, name: str, rel_path: str, suffix: str) -> str:
-        node_type = (node_type or "").lower()
-        is_jsx_file = suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"}
-        is_ts_or_jsx = is_jsx_file or suffix in {".ts", ".js"}
-        is_pascal = bool(name) and name[:1].isupper()
-        # React custom hooks: useXxx convention. Detect in any TS/JS-family
-        # file (React hooks frequently live in plain .ts/.js too).
-        is_hook_name = (
-            len(name) > 3 and name.startswith("use") and name[3:4].isupper()
-        )
-        if is_ts_or_jsx and is_hook_name and ("function" in node_type or "variable" in node_type):
-            return "hook"
-        # In JSX/TSX files, PascalCase function or class declarations are
-        # React components — classify them as such so entity_type='component'
-        # filters work the way users expect (Button, Modal, AntdTable, …).
-        if is_jsx_file and is_pascal and ("class" in node_type or "function" in node_type):
-            return "component"
-        if "class" in node_type:
-            return "class"
-        if "method" in node_type:
-            return "method"
-        if "function" in node_type:
-            return "function"
-        if "interface" in node_type:
-            return "interface"
-        if "enum" in node_type:
-            return "enum"
-        if "type_alias" in node_type or node_type == "type":
-            return "type"
-        if "import" in node_type:
-            return "import"
-        if node_type in {"element", "script_element"}:
-            return "component" if ("-" in name or ":" in name) else "template"
-        if node_type in {"style_element", "stylesheet", "rule_set", "qualified_rule"}:
-            return "style"
-        if node_type in {"class_selector", "id_selector"}:
-            return "selector"
-        if suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"} and name[:1].isupper():
-            return "component"
-        if suffix in {".ts", ".tsx", ".js", ".jsx"}:
-            return "variable"
-        return "symbol"
-
-    def _extract_import_targets(self, code: str) -> list[str]:
-        targets: list[str] = []
-        patterns = [
-            r'^\s*import\s+.+?\s+from\s+["\']([^"\']+)["\']',
-            r'^\s*import\s+["\']([^"\']+)["\']',
-            r'^\s*from\s+([A-Za-z0-9_./-]+)\s+import\s+',
-            r'^\s*require\(\s*["\']([^"\']+)["\']\s*\)',
-        ]
-        for pattern in patterns:
-            for target in re.findall(pattern, code, flags=re.MULTILINE):
-                normalized = self._normalize_whitespace(target, limit=160)
-                if normalized and normalized not in targets:
-                    targets.append(normalized)
-        return targets
-
-    @staticmethod
-    def _infer_symbol_entity_type(symbol: str) -> str:
-        if not symbol:
-            return "symbol"
-        if symbol[:1].isupper():
-            return "class"
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol) and symbol[:1].islower():
-            return "function"
-        return "property"
-
-    def _extract_symbol_relations(
-        self,
-        rel_path: str,
-        code: str,
-        entities: list[dict],
-        relations: list[dict],
-        seen_entities: set[str],
-        scopes: list[dict],
-    ) -> None:
-        lines = code.splitlines()
-        excluded_calls = {
-            "if", "for", "while", "switch", "catch", "return", "typeof", "await",
-            "new", "super", "function", "def", "class", "elif", "with", "print",
-        }
-        suffix = Path(rel_path).suffix.lower()
-        is_jsx = suffix in {".tsx", ".jsx", ".vue", ".svelte", ".astro"}
-        # Calls whose first capitalized argument is the *real* dependency
-        # we want to track. Angular DI hides class usages behind these
-        # factories, so a plain "calls inject" relation is useless on its
-        # own — we also emit "uses ServiceClass" to make
-        # graph_find_usages('ServiceClass') see the dep.
-        di_factories = {"inject", "TestBed.inject"}
-
-        def scope_for_line(line_number: int) -> str:
-            best_name = rel_path
-            best_size: Optional[int] = None
-            for scope in scopes:
-                if scope["line_start"] <= line_number <= scope["line_end"]:
-                    size = scope["line_end"] - scope["line_start"]
-                    if best_size is None or size < best_size:
-                        best_size = size
-                        best_name = scope["name"]
-            return best_name
-
-        seen_relations = {(r.get("from", ""), r.get("relation", ""), r.get("to", "")) for r in relations}
-
-        for idx, line in enumerate(lines, start=1):
-            owner = scope_for_line(idx)
-
-            for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_.$]*)\s*\(", line):
-                raw_name = match.group(1).strip()
-                if not raw_name:
-                    continue
-                symbol = raw_name.split(".")[-1]
-                if symbol.lower() in excluded_calls:
-                    continue
-                if symbol not in seen_entities:
-                    seen_entities.add(symbol)
-                    entities.append({
-                        "name": symbol,
-                        "type": self._infer_symbol_entity_type(symbol),
-                        "description": "Referenced call target",
-                    })
-                rel_key = (owner, "calls", symbol)
-                if rel_key not in seen_relations:
-                    seen_relations.add(rel_key)
-                    relations.append({"from": owner, "relation": "calls", "to": symbol})
-
-                # DI factory: read the first PascalCase identifier from the
-                # arg list and emit a `uses` edge to it.
-                if symbol in di_factories or raw_name in di_factories:
-                    rest = line[match.end():]
-                    arg_match = re.match(r"\s*([A-Z][A-Za-z0-9_]*)", rest)
-                    if arg_match:
-                        service = arg_match.group(1)
-                        if service not in seen_entities:
-                            seen_entities.add(service)
-                            entities.append({
-                                "name": service,
-                                "type": self._infer_symbol_entity_type(service),
-                                "description": f"Injected via {symbol}()",
-                            })
-                        di_key = (owner, "uses", service)
-                        if di_key not in seen_relations:
-                            seen_relations.add(di_key)
-                            relations.append({"from": owner, "relation": "uses", "to": service})
-
-            # JSX component usage: `<Alert />`, `<Layout.Sider>`, `<MyMenu prop=…>`.
-            # Function calls (`Name(`) above already capture HOC/render-fn forms;
-            # this block fills the gap for declarative JSX, which Tree-sitter
-            # node types in our list don't surface.
-            if is_jsx:
-                for match in re.finditer(r"<\s*([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)?)\b", line):
-                    raw = match.group(1).strip()
-                    if not raw:
-                        continue
-                    component = raw.split(".")[0]
-                    if component not in seen_entities:
-                        seen_entities.add(component)
-                        entities.append({
-                            "name": component,
-                            "type": "component",
-                            "description": "JSX component reference",
-                        })
-                    rel_key = (owner, "instantiates", component)
-                    if rel_key not in seen_relations:
-                        seen_relations.add(rel_key)
-                        relations.append({"from": owner, "relation": "instantiates", "to": component})
-
-            for match in re.finditer(r"(?:\.|->)([A-Za-z_][A-Za-z0-9_]*)", line):
-                symbol = match.group(1).strip()
-                if not symbol:
-                    continue
-                if symbol not in seen_entities:
-                    seen_entities.add(symbol)
-                    entities.append({
-                        "name": symbol,
-                        "type": "property",
-                        "description": "Referenced property/member",
-                    })
-                rel_key = (owner, "uses", symbol)
-                if rel_key not in seen_relations:
-                    seen_relations.add(rel_key)
-                    relations.append({"from": owner, "relation": "uses", "to": symbol})
-
-    @staticmethod
-    def _angular_decorator_overrides(code: str, suffix: str) -> dict[str, str]:
-        """Map ``ClassName -> refined_type`` for Angular/NestJS-decorated classes.
-
-        Tree-sitter's class_declaration node type loses the decorator context,
-        so a quick regex pre-scan is the cheapest way to recover it. Each
-        ``@Decorator`` is followed (after some chars of metadata) by the next
-        ``class Foo`` declaration — that pairing is what we capture.
-        """
-        if suffix not in {".ts", ".js"}:
-            return {}
-        decorator_to_type = {
-            # Angular
-            "Component": "component",
-            "Directive": "directive",
-            "Injectable": "service",
-            "NgModule": "module",
-            "Pipe": "pipe",
-            # NestJS (some shared with Angular: Injectable, Pipe)
-            "Module": "module",
-            "Controller": "controller",
-        }
-        out: dict[str, str] = {}
-        pattern = r"@(" + "|".join(re.escape(k) for k in decorator_to_type) + r")\b"
-        for m in re.finditer(pattern, code):
-            tail = code[m.end() : m.end() + 4000]
-            m2 = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", tail)
-            if m2:
-                out[m2.group(1)] = decorator_to_type[m.group(1)]
-        return out
-
-    @staticmethod
-    def _ts_constructor_dependencies(code: str, suffix: str) -> list[tuple[str, str]]:
-        """Return [(class_name, dep_type), ...] from ``constructor(...)`` params.
-
-        Catches Angular and NestJS DI which both use the same shape:
-            constructor(private foo: FooService, public bar: BarService) {}
-        Only PascalCase types are captured (TS primitives like ``string``
-        are skipped — they don't correspond to graph entities).
-        """
-        if suffix not in {".ts", ".js"}:
-            return []
-        out: list[tuple[str, str]] = []
-        for m_class in re.finditer(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", code):
-            cls_name = m_class.group(1)
-            # Limit search window to before the next class declaration.
-            next_class = re.search(r"\bclass\s+[A-Z]", code[m_class.end():])
-            window_end = m_class.end() + (next_class.start() if next_class else len(code) - m_class.end())
-            m_ctor = re.search(r"\bconstructor\s*\(", code[m_class.end():window_end])
-            if not m_ctor:
-                continue
-            # Match the closing paren for the constructor parameter list.
-            start = m_class.end() + m_ctor.end()
-            depth = 1
-            i = start
-            while i < window_end and i < len(code) and depth > 0:
-                c = code[i]
-                if c == "(":
-                    depth += 1
-                elif c == ")":
-                    depth -= 1
-                i += 1
-            if depth != 0:
-                continue
-            params = code[start : i - 1]
-            for m_p in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*\s*:\s*([A-Z][A-Za-z0-9_]*)", params):
-                out.append((cls_name, m_p.group(1)))
-        return out
-
-    @staticmethod
-    def _angular_component_metadata(code: str, suffix: str) -> list[dict]:
-        """Return template-related links emitted by ``@Component({...})``.
-
-        For each decorator block we extract:
-          * ``selector`` string  → defines edge: ``Class defines 'app-foo'``
-            (template extractor emits matching ``uses`` edges from .html files)
-          * ``templateUrl`` path → uses edge:  ``Class uses ./foo.html``
-          * each ``styleUrls`` path → uses edge: ``Class uses ./foo.scss``
-
-        Each entry has shape ``{"class": str, "kind": "selector"|"template"|"style", "value": str}``.
-        """
-        if suffix not in {".ts", ".js"}:
-            return []
-        out: list[dict] = []
-        for m in re.finditer(r"@(Component|Directive)\s*\(\s*\{", code):
-            start = m.end()
-            depth = 1
-            i = start
-            while i < len(code) and depth > 0:
-                c = code[i]
-                if c == "{":
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                i += 1
-            if depth != 0:
-                continue
-            body = code[start : i - 1]
-            rest = code[i : i + 4000]
-            m_cls = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", rest)
-            if not m_cls:
-                continue
-            owner = m_cls.group(1)
-            m_sel = re.search(r"selector\s*:\s*['\"]([^'\"]+)['\"]", body)
-            if m_sel:
-                out.append({"class": owner, "kind": "selector", "value": m_sel.group(1).strip()})
-            m_tpl = re.search(r"templateUrl\s*:\s*['\"]([^'\"]+)['\"]", body)
-            if m_tpl:
-                out.append({"class": owner, "kind": "template", "value": m_tpl.group(1).strip()})
-            m_styles = re.search(r"styleUrls?\s*:\s*\[([^\]]*)\]", body)
-            if m_styles:
-                for m_p in re.finditer(r"['\"]([^'\"]+)['\"]", m_styles.group(1)):
-                    out.append({"class": owner, "kind": "style", "value": m_p.group(1).strip()})
-        return out
-
-    @staticmethod
-    def _module_metadata_dependencies(code: str, suffix: str) -> list[tuple[str, str]]:
-        """Return [(module_class, identifier), ...] from ``@NgModule``/``@Module`` arrays.
-
-        Looks at the declarations/imports/providers/bootstrap/controllers/
-        exports fields — anything in those arrays that looks like a class.
-        """
-        if suffix not in {".ts", ".js"}:
-            return []
-        out: list[tuple[str, str]] = []
-        for m in re.finditer(r"@(NgModule|Module)\s*\(\s*\{", code):
-            start = m.end()
-            depth = 1
-            i = start
-            while i < len(code) and depth > 0:
-                c = code[i]
-                if c == "{":
-                    depth += 1
-                elif c == "}":
-                    depth -= 1
-                i += 1
-            if depth != 0:
-                continue
-            body = code[start : i - 1]
-            rest = code[i : i + 4000]
-            m_cls = re.search(r"\bclass\s+([A-Z][A-Za-z0-9_]*)", rest)
-            if not m_cls:
-                continue
-            owner = m_cls.group(1)
-            for m_arr in re.finditer(
-                r"\b(declarations|imports|providers|bootstrap|controllers|exports|entryComponents)\s*:\s*\[([^\]]*)\]",
-                body,
-            ):
-                for m_id in re.finditer(r"\b[A-Z][A-Za-z0-9_]*\b", m_arr.group(2)):
-                    out.append((owner, m_id.group(0)))
-        return out
-
-    @staticmethod
-    def _angular_runtime_references(code: str, rel_path: str, suffix: str) -> list[tuple[str, str]]:
-        """Identifiers wired by Angular runtime APIs the call-graph would otherwise miss.
-
-        Covers the four ways modern Angular apps reference services / guards /
-        components without an explicit call site:
-
-          * Standalone bootstrap helpers:  ``provideRouter(routes)``,
-            ``provideHttpClient(withInterceptors([jwt, error]))``,
-            ``provideAnimations()`` — the inner identifiers are wired by the DI
-            container, never called directly.
-          * Route guard / resolver arrays: ``canActivate: [authGuard]``,
-            ``resolve: { user: UserResolver }``.
-          * Provider config objects: ``{ provide: X, useFactory: initAuth }``
-            / ``useClass: FooImpl`` / ``useExisting: BarToken``.
-          * Route component refs: ``{ path: 'home', component: HomeComponent }``.
-
-        Returns ``(from_entity, dep_name)`` tuples — ``from_entity`` is the file
-        path because these references usually live at module scope, not inside
-        a class.
-        """
-        if suffix not in {".ts", ".js", ".mts", ".cts", ".mjs", ".cjs"}:
-            return []
-        out: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-
-        def _emit(dep: str) -> None:
-            if not dep or dep[:1].isdigit():
-                return
-            if dep in _ANGULAR_RUNTIME_KEYWORDS:
-                return
-            key = (rel_path, dep)
-            if key in seen:
-                return
-            seen.add(key)
-            out.append(key)
-
-        # provideXxx(...) / withXxx(...) — standalone API surface.
-        for m in re.finditer(r'\b(?:provide|with)[A-Z]\w*\s*\(([^)]*)\)', code):
-            for m_id in re.finditer(r'\b([A-Za-z_]\w*)\b', m.group(1)):
-                _emit(m_id.group(1))
-
-        # Route guard / resolver arrays.
-        for m in re.finditer(
-            r'\b(?:canActivate|canActivateChild|canDeactivate|canLoad|canMatch)'
-            r'\s*:\s*\[([^\]]*)\]',
-            code,
-        ):
-            for m_id in re.finditer(r'\b([A-Za-z_]\w*)\b', m.group(1)):
-                _emit(m_id.group(1))
-
-        # resolve: { key: Resolver, ... }  — object form, distinct from the
-        # method named 'resolve' on a Resolver class.
-        for m in re.finditer(r'\bresolve\s*:\s*\{([^}]*)\}', code):
-            for m_id in re.finditer(r':\s*([A-Z]\w*)', m.group(1)):
-                _emit(m_id.group(1))
-
-        # Provider object forms.
-        for m in re.finditer(r'\buse(?:Factory|Class|Existing)\s*:\s*([A-Za-z_]\w*)', code):
-            _emit(m.group(1))
-
-        # Route component refs.
-        for m in re.finditer(r'\bcomponent\s*:\s*([A-Z]\w*)', code):
-            _emit(m.group(1))
-
-        # Lazy-loaded routes: loadComponent: () => import('...').then(m => m.FooComponent)
-        for m in re.finditer(r'\bm\s*\.\s*([A-Z]\w*)\s*\)', code):
-            _emit(m.group(1))
-
-        return out
-
-    def _extract_with_tree_sitter(self, filepath: Path, code: str) -> dict:
-        parser = self._get_tree_sitter_parser(filepath)
-        rel_path = filepath.relative_to(self.project_root).as_posix()
-        if parser is None:
-            return {"entities": [], "relations": []}
-        try:
-            source = code.encode("utf-8", errors="ignore")
-            tree = parser.parse(source)
-        except Exception:
-            return {"entities": [], "relations": []}
-
-        suffix = filepath.suffix.lower()
-        ng_overrides = self._angular_decorator_overrides(code, suffix)
-        entities = [self._make_file_entity(rel_path, "module", "Source file")]
-        relations: list[dict] = []
-        seen_entities = {rel_path}
-        scopes: list[dict] = []
-
-        stack = [tree.root_node]
-        while stack:
-            node = stack.pop()
-            if node.type in _TREE_SITTER_NODE_TYPES:
-                name = self._extract_tree_sitter_name(node, source)
-                name = self._normalize_whitespace(name, limit=160)
-                if name and name not in seen_entities:
-                    seen_entities.add(name)
-                    entity_type = self._infer_tree_sitter_entity_type(node.type, name, rel_path, suffix)
-                    if entity_type == "class" and name in ng_overrides:
-                        entity_type = ng_overrides[name]
-                    entities.append({
-                        "name": name,
-                        "type": entity_type,
-                        "description": f"Extracted from {node.type}",
-                    })
-                    relations.append({"from": rel_path, "relation": "defines", "to": name})
-                if name:
-                    scopes.append({
-                        "name": name,
-                        "line_start": node.start_point[0] + 1,
-                        "line_end": node.end_point[0] + 1,
-                    })
-            stack.extend(reversed(node.children))
-
-        for target in self._extract_import_targets(code):
-            if target not in seen_entities:
-                seen_entities.add(target)
-                entities.append({"name": target, "type": "import", "description": "Imported module"})
-            relations.append({"from": rel_path, "relation": "imports", "to": target})
-
-        self._extract_symbol_relations(rel_path, code, entities, relations, seen_entities, scopes)
-
-        # Angular / NestJS DI — `uses` edges from constructor-injected types
-        # and from @NgModule / @Module metadata arrays. Tree-sitter doesn't
-        # surface these on its own, but they're the dominant way deps wire
-        # up in those frameworks.
-        seen_relations = {(r.get("from", ""), r.get("relation", ""), r.get("to", "")) for r in relations}
-        for owner, dep in self._ts_constructor_dependencies(code, suffix):
-            if dep not in seen_entities:
-                seen_entities.add(dep)
-                entities.append({
-                    "name": dep,
-                    "type": self._infer_symbol_entity_type(dep),
-                    "description": "Injected via constructor",
-                })
-            key = (owner, "uses", dep)
-            if key not in seen_relations:
-                seen_relations.add(key)
-                relations.append({"from": owner, "relation": "uses", "to": dep})
-        for owner, dep in self._module_metadata_dependencies(code, suffix):
-            if dep not in seen_entities:
-                seen_entities.add(dep)
-                entities.append({
-                    "name": dep,
-                    "type": self._infer_symbol_entity_type(dep),
-                    "description": "Module metadata reference",
-                })
-            key = (owner, "uses", dep)
-            if key not in seen_relations:
-                seen_relations.add(key)
-                relations.append({"from": owner, "relation": "uses", "to": dep})
-
-        # Standalone provideX / withX / canActivate arrays / useFactory etc.
-        # — see _angular_runtime_references for the full list of patterns.
-        for owner, dep in self._angular_runtime_references(code, rel_path, suffix):
-            if dep not in seen_entities:
-                seen_entities.add(dep)
-                entities.append({
-                    "name": dep,
-                    "type": self._infer_symbol_entity_type(dep),
-                    "description": "Angular runtime reference",
-                })
-            key = (owner, "uses", dep)
-            if key not in seen_relations:
-                seen_relations.add(key)
-                relations.append({"from": owner, "relation": "uses", "to": dep})
-
-        # @Component({selector, templateUrl, styleUrls}) — link the class to
-        # its template tag, html file, and stylesheet so graph_find_usages
-        # of either side surfaces the other.
-        parent_dir = Path(rel_path).parent.as_posix()
-        for link in self._angular_component_metadata(code, suffix):
-            owner = link["class"]
-            value = link["value"]
-            kind = link["kind"]
-            if kind == "selector":
-                if value not in seen_entities:
-                    seen_entities.add(value)
-                    entities.append({
-                        "name": value,
-                        "type": "selector",
-                        "description": "Angular component selector",
-                    })
-                key = (owner, "defines", value)
-                if key not in seen_relations:
-                    seen_relations.add(key)
-                    relations.append({"from": owner, "relation": "defines", "to": value})
-            else:
-                # Resolve relative paths against the .ts file's directory so
-                # the target matches whatever the .html / .scss extractor stored.
-                resolved = value
-                if value.startswith("./") or value.startswith("../") or not value.startswith("/"):
-                    try:
-                        resolved = (Path(parent_dir) / value).as_posix()
-                    except Exception:
-                        resolved = value
-                resolved = resolved.lstrip("./")
-                if resolved not in seen_entities:
-                    seen_entities.add(resolved)
-                    entities.append({
-                        "name": resolved,
-                        "type": "template" if kind == "template" else "style",
-                        "description": f"Angular {kind} reference",
-                    })
-                key = (owner, "uses", resolved)
-                if key not in seen_relations:
-                    seen_relations.add(key)
-                    relations.append({"from": owner, "relation": "uses", "to": resolved})
-
-        return {"entities": entities, "relations": relations}
-
-    async def _extract_with_strategy(
-        self, filepath: Path, code: str, force_llm: bool = False
-    ) -> tuple[dict, str]:
-        rel_path = filepath.relative_to(self.project_root).as_posix()
-        # ``force_llm`` is kept for API compatibility but is now a no-op —
-        # every source file already goes through the LLM extractor (see
-        # ``_extractor_strategy``). Tree-sitter extraction was removed because
-        # its descriptions ("Extracted from function_definition") carried no
-        # semantics and its regex relation scanner produced phantom edges.
-        if force_llm:
-            return await self.llm_extractor.extract(rel_path, code), "llm"
-        strategy = self._extractor_strategy(filepath)
-        if strategy != "llm":
-            structured = self._extract_structured(filepath, code)
-            if structured.get("entities") or structured.get("relations"):
-                return structured, strategy
-        return await self.llm_extractor.extract(rel_path, code), "llm"
-
-    @staticmethod
     def _detect_traits(name: str, snippet: str, file: str, entity_type: str) -> str:
         """Detect language-aware markers from the entity head.
 
@@ -1678,11 +930,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             )
 
     async def index_file(self, filepath: Path, force_llm: bool = False) -> None:
-        # ``force_llm`` bypasses the freshness check and the tree-sitter /
-        # structured extractors: the file is sent straight to the LLM
-        # extractor, even if it was already indexed by tree-sitter. Use
-        # when re-indexing a file whose semantic extraction needs the LLM
-        # (e.g. tree-sitter pulled garbage names, mixed-dialect file).
+        # ``force_llm`` bypasses the freshness check: the file is re-indexed
+        # through the LLM extractor even when not stale. Since the LLM is the
+        # only source-code extractor now, this is mostly a "re-index even if
+        # mtime matches" override.
         if not force_llm and not self._file_needs_update(filepath):
             return
         rel = filepath.relative_to(self.project_root).as_posix()
@@ -1738,7 +989,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         rebuild_faiss: bool = False,
         incoming_complete: bool = False,
     ) -> dict:
-        """Direct graph write — bypasses tree-sitter / LLM extractor pipeline.
+        """Direct graph write — bypasses the LLM extractor pipeline.
 
         Use case: a RAG-builder sub-agent does extraction itself (its own
         LLM call over multi-file context) and submits the resulting graph
@@ -1838,7 +1089,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         raw_entities = list(entities or [])
         # Ensure the file's own module-entity exists as a graph node, so the
         # module-level import/call edges (from_name = rel_path) point at a real
-        # node — mirrors what the tree-sitter path does via _make_file_entity.
+        # node — mirrors what the auto-extractor emits via _make_file_entity.
         # Only for full-file writes (entities present); additive reverse-grep
         # writes (entities=[]) must not resurrect a wiped file node.
         if entities and not any(e.get("name") == rel for e in raw_entities if isinstance(e, dict)):
@@ -1948,10 +1199,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
         with sqlite3.connect(self.db_path) as con:
             # Self-heal: ensure the file-entity exists. ``add_entity`` may
-            # be the first call for a file (no prior tree-sitter pass),
-            # in which case ``_make_file_entity`` never ran. Without this
-            # row, relations targeting this file's path won't have an
-            # endpoint to resolve against.
+            # be the first call for a file (no prior extraction pass), in
+            # which case ``_make_file_entity`` never ran. Without this row,
+            # relations targeting this file's path won't have an endpoint
+            # to resolve against.
             con.execute(
                 "INSERT OR IGNORE INTO entities(file, name, type, description) VALUES(?,?,?,?)",
                 (rel, rel, "module", "Source file"),
@@ -2338,11 +1589,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     ) -> dict:
         """Index every stale file by default. Pass ``max_files`` to cap one call.
 
-        ``force_llm=True`` routes every file through the LLM extractor instead
-        of tree-sitter / structured parsers, AND re-indexes files that aren't
-        stale — useful when tree-sitter mis-parsed a previous build or when
-        you need semantic extraction across the board. Expensive: every file
-        becomes one LLM call. Cap with ``max_files`` to keep cost predictable.
+        ``force_llm=True`` re-indexes every file (not just stale ones) through
+        the LLM extractor — useful when you want a full refresh regardless of
+        freshness. Every source file is an LLM call, so cap with
+        ``max_files`` to keep cost predictable.
         """
         self._is_building = True
         try:
@@ -2352,8 +1602,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             logger.info("Graph file scan: %d files in %.2fs", len(files), t1 - t0)
             deleted_files = self._cleanup_deleted_files(files)
             if force_llm:
-                # Re-index everything, not just stale — caller asked for an
-                # LLM pass and probably wants existing tree-sitter rows replaced.
+                # Re-index everything, not just stale — caller wants a full
+                # refresh through the LLM extractor.
                 stale = list(files)
             else:
                 stale = [f for f in files if self._file_needs_update(f)]
@@ -2606,82 +1856,6 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             for snippet_line in entity["snippet"].splitlines():
                 lines.append(f"      {snippet_line}")
         return lines
-
-    @staticmethod
-    def _get_tree_sitter_parser(path: Path):
-        language_name = _TREE_SITTER_LANGUAGES.get(path.suffix.lower())
-        if not language_name:
-            return None
-        try:
-            from tree_sitter_language_pack import get_parser
-            return get_parser(language_name)
-        except Exception:
-            try:
-                from tree_sitter_languages import get_parser
-                return get_parser(language_name)
-            except Exception:
-                return None
-
-    @staticmethod
-    def _extract_tree_sitter_name(node, source: bytes) -> str:
-        # `const Flex = ...` parses as lexical_declaration → variable_declarator
-        # → name. The old fallback loop grabbed the leading "const"/"let"
-        # keyword as the entity name, so every const/let declaration ended up
-        # in the graph as "const"/"let" instead of its real identifier. Find
-        # the declarator child first and read its `name` field.
-        if node.type in ("lexical_declaration", "variable_declaration"):
-            for child in node.children:
-                if child.type in ("variable_declarator", "init_declarator"):
-                    name_node = child.child_by_field_name("name")
-                    if name_node is None:
-                        # Some grammars expose the identifier as a positional
-                        # child rather than a named field.
-                        for grand in child.children:
-                            if grand.type in ("identifier", "property_identifier", "type_identifier"):
-                                name_node = grand
-                                break
-                    if name_node is not None:
-                        return source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore").strip()
-        for field_name in _TREE_SITTER_NAME_FIELDS:
-            child = node.child_by_field_name(field_name)
-            if child is not None:
-                return source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore").strip()
-        # Last-resort identifier scan, but skip the variable-declaration
-        # keywords that tripped the old logic.
-        skip = {"const", "let", "var", "function", "class", "type", "interface", "enum"}
-        for child in node.children:
-            child_text = source[child.start_byte:child.end_byte].decode("utf-8", errors="ignore").strip()
-            if not child_text or child_text in skip:
-                continue
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$]*", child_text):
-                return child_text
-        return ""
-
-    def _find_entity_with_tree_sitter(self, path: Path, entity_name: str, lines: list[str]) -> dict:
-        parser = self._get_tree_sitter_parser(path)
-        if parser is None:
-            return {"line_start": None, "line_end": None, "snippet": ""}
-        try:
-            source = path.read_bytes()
-        except Exception:
-            return {"line_start": None, "line_end": None, "snippet": ""}
-        try:
-            tree = parser.parse(source)
-        except Exception:
-            return {"line_start": None, "line_end": None, "snippet": ""}
-        stack = [tree.root_node]
-        while stack:
-            node = stack.pop()
-            if node.type in _TREE_SITTER_NODE_TYPES:
-                node_name = self._extract_tree_sitter_name(node, source)
-                if node_name == entity_name:
-                    start_line = node.start_point[0] + 1
-                    end_line = node.end_point[0] + 1
-                    snippet = "\n".join(lines[node.start_point[0]:node.end_point[0] + 1]).strip()
-                    return {"line_start": start_line, "line_end": end_line, "snippet": snippet}
-            stack.extend(reversed(node.children))
-        return {"line_start": None, "line_end": None, "snippet": ""}
-
     def _find_entity_snippet(self, rel_path: str, entity_name: str) -> dict:
         path = self.project_root / rel_path
         try:
@@ -2691,16 +1865,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         lines = text.splitlines()
         if not lines:
             return {"line_start": None, "line_end": None, "snippet": ""}
-        tree_sitter_result = self._find_entity_with_tree_sitter(path, entity_name, lines)
-        if tree_sitter_result["line_start"] is not None:
-            return tree_sitter_result
-        # Priority-ordered: scan ALL lines for a real definition form
-        # (def/class/function/const/...) before falling back to a bare
-        # textual mention. A line-by-line loop that breaks on the first
-        # match of ANY pattern lets a comment merely mentioning the name
-        # (e.g. line 43) shadow the actual `def` further down (line 121).
-        # So loop patterns in the OUTER position: the weakest pattern
-        # (bare name) is only consulted if no definition form exists.
+        # Priority-ordered regex scan: try a real definition form
+        # (def/class/function/const/...) before falling back to a bare textual
+        # mention. A line-by-line loop that breaks on the first match of ANY
+        # pattern lets a comment merely mentioning the name (e.g. line 43)
+        # shadow the actual `def` further down (line 121). So loop patterns in
+        # the OUTER position: the weakest pattern (bare name) is only consulted
+        # if no definition form exists.
         patterns = [
             f"def {entity_name}",
             f"class {entity_name}",
