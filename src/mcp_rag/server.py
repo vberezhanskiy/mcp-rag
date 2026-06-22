@@ -24,9 +24,8 @@ from pydantic import AnyUrl
 from .config import Config
 from .core import embedder
 from .core.context import ContextStore
-from .core.formatter import format_memory_listing
 from .core.graph import CodeGraph
-from .core.memory import Memory, MemorySystem
+from .core.memory import MemorySystem
 from .core.metrics import default_metrics
 from .core.retriever import MultiLangCodeRetriever
 from .llm.extractor import LLMExtractor, NoOpExtractor, OpenAICompatExtractor
@@ -79,16 +78,6 @@ class Services:
         if not hasattr(self, "_contexts") or self._contexts is None:
             self._contexts = ContextStore(self.config.project_dir)
         return self._contexts
-
-
-def _memory_disabled() -> bool:
-    """``MCP_RAG_NO_MEMORY=1`` hides the memory_* tools.
-
-    Useful when the host already has its own persistent memory (e.g.
-    Claude Code's ``~/.claude/memory/``) and the duplicate surface in
-    the tool list is just noise.
-    """
-    return (os.getenv("MCP_RAG_NO_MEMORY") or "").strip() in {"1", "true", "yes", "on"}
 
 
 def _build_tools() -> list[Tool]:
@@ -989,83 +978,7 @@ def _build_tools() -> list[Tool]:
                 "required": ["name"],
             },
         ),
-        Tool(
-            name="memory_save",
-            description=(
-                "Persist a fact about this project (decision, convention, "
-                "DTO shape, operational note). Stored per project root, "
-                "indexed for hybrid search. Returns the memory id.\n\n"
-                "If you already track project notes in another system "
-                "(Claude Code's local memory, Obsidian, etc.), prefer that "
-                "and skip this — mcp-rag memory is most useful when "
-                "multiple tools/IDEs share the same MCP server."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "memory_type": {"type": "string", "default": "general"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "default": []},
-                },
-                "required": ["content"],
-            },
-        ),
-        Tool(
-            name="memory_search",
-            description=(
-                "Hybrid BM25 + dense search across stored project "
-                "memories. Optional filter by memory_type. Top score "
-                "with a wide gap to the runner-up usually means a clean "
-                "hit; flat distribution means no real match."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "top_k": {"type": "integer", "default": 5},
-                    "memory_type": {"type": "string"},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="memory_list",
-            description=(
-                "List all stored memories for this project, optionally "
-                "filtered by memory_type. Useful for review and curation."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {"memory_type": {"type": "string"}},
-            },
-        ),
-        Tool(
-            name="memory_delete",
-            description=(
-                "Remove a single memory by its id, or — if `query` is "
-                "given instead — every memory whose content contains that "
-                "substring (case-insensitive). Pass exactly one of the "
-                "two."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "memory_id": {"type": "string"},
-                    "query": {"type": "string"},
-                },
-            },
-        ),
-        Tool(
-            name="memory_clear",
-            description=(
-                "Wipe all memories for this project. Destructive and "
-                "non-reversible — use only when starting over."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-        ),
     ]
-    if _memory_disabled():
-        tools = [t for t in tools if not t.name.startswith("memory_")]
     return tools
 
 
@@ -1837,51 +1750,13 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         ok = services.contexts.delete(str(args.get("name") or "").strip())
         return f"✅ Deleted context {args.get('name')!r}." if ok else f"No context named {args.get('name')!r}."
 
-    if name.startswith("memory_") and _memory_disabled():
+    if name.startswith("memory_"):
         return (
-            "memory_* tools are disabled on this server "
-            "(MCP_RAG_NO_MEMORY=1). Unset the env var to re-enable."
+            "memory_* tools have been removed from this server. "
+            "Use the worker's memory_save / memory_search / memory_list / "
+            "memory_delete / memory_clear tools instead — they share the "
+            "same per-project storage."
         )
-
-    if name == "memory_save":
-        mem = Memory(
-            content=args["content"],
-            memory_type=args.get("memory_type", "general"),
-            tags=list(args.get("tags") or []),
-        )
-        result = services.memory.add_or_update_memory(mem)
-        return f"Memory {result}: id={mem.id} type={mem.memory_type}"
-
-    if name == "memory_search":
-        results = services.memory.search(
-            args["query"],
-            top_k=int(args.get("top_k", 5)),
-            memory_type=args.get("memory_type") or None,
-        )
-        if not results:
-            return "No matching memories."
-        lines = [f"{len(results)} matching memories:"]
-        for mem, score in results:
-            tags = " ".join(mem.tags)
-            lines.append(f"  [{mem.memory_type}] score={score:.2f} {mem.content}" + (f" {tags}" if tags else ""))
-        return "\n".join(lines)
-
-    if name == "memory_list":
-        memories = services.memory.get_all_memories(memory_type=args.get("memory_type") or None)
-        return format_memory_listing(memories, title="Memories")
-
-    if name == "memory_delete":
-        if args.get("memory_id"):
-            ok = services.memory.delete_memory(args["memory_id"])
-            return "Deleted." if ok else "Not found."
-        if args.get("query"):
-            n = services.memory.delete_memories_by_query(args["query"])
-            return f"Deleted {n} memories matching {args['query']!r}."
-        return "Provide either memory_id or query."
-
-    if name == "memory_clear":
-        services.memory.clear_all()
-        return "All memories cleared."
 
     return f"Unknown tool: {name}"
 
