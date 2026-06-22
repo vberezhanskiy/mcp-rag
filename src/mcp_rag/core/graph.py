@@ -798,8 +798,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return "config"
         if suffix in {".html", ".htm", ".vue", ".svelte", ".astro"}:
             return "template"
-        if suffix in _TREE_SITTER_LANGUAGES:
-            return "tree_sitter"
+        # Tree-sitter extraction is intentionally disabled: its output was
+        # shallow (entity name + a generic "Extracted from <node_type>"
+        # description) and the regex-based call/uses relation scanner produced
+        # noisy phantom edges to keywords/builtins. The LLM extractor yields
+        # real semantic descriptions and accurate relations, so every source
+        # language now routes through it. Tree-sitter is still kept for the
+        # entity *location* lookup (_find_entity_with_tree_sitter), which only
+        # needs the AST to anchor line_start/line_end — not for extraction.
         return "llm"
 
     @staticmethod
@@ -1526,20 +1532,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         self, filepath: Path, code: str, force_llm: bool = False
     ) -> tuple[dict, str]:
         rel_path = filepath.relative_to(self.project_root).as_posix()
-        # ``force_llm`` skips tree-sitter / structured extractors and goes
-        # directly to the LLM. Used when the caller explicitly wants a
-        # semantic extraction (e.g. tree-sitter mis-parses a dialect, or the
-        # file is in a language the deterministic extractors don't cover
-        # well). Returns whatever the LLM produced — including empty when
-        # no LLM is configured (NoOpExtractor) — so the caller sees the
-        # outcome instead of silently falling back.
+        # ``force_llm`` is kept for API compatibility but is now a no-op —
+        # every source file already goes through the LLM extractor (see
+        # ``_extractor_strategy``). Tree-sitter extraction was removed because
+        # its descriptions ("Extracted from function_definition") carried no
+        # semantics and its regex relation scanner produced phantom edges.
         if force_llm:
             return await self.llm_extractor.extract(rel_path, code), "llm"
         strategy = self._extractor_strategy(filepath)
-        if strategy == "tree_sitter":
-            extracted = self._extract_with_tree_sitter(filepath, code)
-            if extracted.get("entities") or extracted.get("relations"):
-                return extracted, strategy
         if strategy != "llm":
             structured = self._extract_structured(filepath, code)
             if structured.get("entities") or structured.get("relations"):
