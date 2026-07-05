@@ -1057,10 +1057,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 "skipped": (
                     "R3 violated: code/template file requires ≥1 relation. "
                     "For source files: emit --imports--> edges from the "
-                    "import block. For Angular/Vue/Svelte templates: emit "
-                    "--uses--> for each <component-selector> referenced and "
-                    "--calls--> for each (click)/(submit)/event-handler. "
-                    "Re-read the file and resubmit with relations populated."
+                    "import block AND --calls--/--uses--/--instantiates-- "
+                    "edges for how the file's definitions are referenced — "
+                    "INCLUDING calls between definitions inside THIS same "
+                    "file (a function called only within its own module is "
+                    "still used; do not omit same-file call edges). For "
+                    "Angular/Vue/Svelte templates: emit --uses--> for each "
+                    "<component-selector> referenced and --calls--> for each "
+                    "(click)/(submit)/event-handler. Re-read the file and "
+                    "resubmit with relations populated."
                 ),
             }
 
