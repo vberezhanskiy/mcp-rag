@@ -25,7 +25,7 @@ from typing import Optional
 import gitignore_parser
 import json5
 
-from .embedder import encode_batch_size, encode_documents
+from .embedder import encode_batch_size, encode_documents, encode_query
 from .graph_analysis import GraphAnalysisMixin
 from .graph_text import GraphTextMixin
 from ..llm.extractor import LLMExtractor, NoOpExtractor
@@ -1057,10 +1057,36 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 "skipped": (
                     "R3 violated: code/template file requires ≥1 relation. "
                     "For source files: emit --imports--> edges from the "
-                    "import block. For Angular/Vue/Svelte templates: emit "
-                    "--uses--> for each <component-selector> referenced and "
-                    "--calls--> for each (click)/(submit)/event-handler. "
-                    "Re-read the file and resubmit with relations populated."
+                    "import block AND --calls--/--uses--/--instantiates-- "
+                    "edges for how the file's definitions are referenced — "
+                    "INCLUDING calls between definitions inside THIS same "
+                    "file (a function called only within its own module is "
+                    "still used; do not omit same-file call edges). For "
+                    "Angular/Vue/Svelte templates: emit --uses--> for each "
+                    "<component-selector> referenced and --calls--> for each "
+                    "(click)/(submit)/event-handler. Re-read the file and "
+                    "resubmit with relations populated."
+                ),
+            }
+
+        # A fully-empty write (entities=[], relations=[], no completion
+        # flag) used to wipe the file's data AND register it in file_meta
+        # as fully indexed (incoming_done=1) — the file silently vanished
+        # from ``get_pending_files`` with zero content, letting a build
+        # agent "clear" a file it never studied. Reject it instead: the
+        # caller must either submit real content, or an explicit
+        # completion write (``incoming_complete=True``).
+        if not entities and not relations and not incoming_complete:
+            return {
+                "file": rel,
+                "entities": 0,
+                "relations": 0,
+                "skipped": (
+                    "empty write: no entities, no relations, and "
+                    "incoming_complete is False — this would mark the file "
+                    "as indexed with zero content. Submit the file's actual "
+                    "entities/relations, or pass incoming_complete=True for "
+                    "a deliberate completion write."
                 ),
             }
 
@@ -1070,14 +1096,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # (entities=[], relations=[edge,...]) the intent is "add edges
         # to an already-indexed file", NOT "replace it". Wiping would
         # destroy the file's previously-indexed entities. So only wipe
-        # when entities are present, or when both lists are empty
-        # (explicit full clear of this file).
+        # for full-file writes (entities present).
         # An additive reverse-grep / completion write carries no entities
         # (it only adds incoming edges to an already-indexed file, or just
         # flips the completion flag). Such a call must NOT wipe the file —
         # even when it carries zero relations (``incoming_complete=True`` with
-        # nothing found). Only wipe for full-file writes (entities present).
-        if entities or (not relations and not incoming_complete):
+        # nothing found).
+        if entities:
             self._delete_file_data(rel)
         else:
             logger.info(
@@ -1694,6 +1719,28 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             parts.append((description or "").strip())
         return "\n".join(parts)
 
+    def ensure_faiss(self) -> None:
+        """Lazily (re)build the in-memory FAISS index when it is missing or stale.
+
+        The index is process-local: a freshly started process has
+        ``faiss_index=None`` even though ``graph.db`` is fully populated —
+        without this hook every semantic search silently degrades to
+        LIKE-only until someone explicitly calls ``rebuild_faiss()``.
+        Rebuilds are cheap on warm ``embedding_cache`` (only changed
+        entities hit the encoder).
+        """
+        if not self._faiss_dirty and self.faiss_index is not None:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as con:
+                n = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        except Exception:
+            return
+        if n:
+            self._rebuild_faiss()
+        else:
+            self._faiss_dirty = False
+
     def _rebuild_faiss(self) -> None:
         self._faiss_dirty = False
         try:
@@ -1933,6 +1980,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return results
 
     def search_entity(self, query: str, entity_type: Optional[str] = None, limit: int = 10) -> list[dict]:
+        # Semantic re-ranking / fallback below needs the FAISS index, which
+        # is process-local — build it lazily so a fresh process doesn't
+        # silently degrade to LIKE-only search.
+        self.ensure_faiss()
         # Tokenize so multi-word queries ("Layout Sider Header") don't fall
         # through as a single LIKE that nothing matches. Each token contributes
         # an OR-clause; we then favor rows that hit the most tokens.
