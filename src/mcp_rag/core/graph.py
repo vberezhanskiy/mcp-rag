@@ -75,6 +75,10 @@ _CODE_EXTENSIONS = [
     "*.html", "*.htm", "*.css", "*.scss", "*.sass", "*.less",
     "*.jinja", "*.jinja2", "*.j2", "*.njk", "*.hbs", "*.ejs",
     "*.yaml", "*.yml", "*.toml", "*.json",
+    # Env files: ".env" itself plus the common variants. Matching is
+    # ``filename.endswith(suffix)`` so each variant is listed explicitly.
+    "*.env", ".env.example", ".env.sample", ".env.local", ".env.test",
+    ".env.development", ".env.production",
     "*.tf", "*.tfvars", "*.hcl", "*.nix",
     "*.sol",
     "*.md", "*.markdown", "*.tex", "*.rst",
@@ -493,7 +497,11 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # Exact-match against path components — substring check would filter
         # files like Layout.tsx/Login.tsx because their parent dir lowercase
         # contains "out"/"log".
-        parts = set(path.parts)
+        # Only DIRECTORY components are checked — the final path component is
+        # the filename, and _IGNORE_DIRS contains names like ".env"/"env"
+        # that are also legitimate FILE names (a project's .env file must not
+        # be ignored because a directory of the same name would be).
+        parts = set(path.parts[:-1]) if path.parts else set()
         if parts & _IGNORE_DIRS:
             return True
         if self._extra_ignore_dirs and (parts & self._extra_ignore_dirs):
@@ -622,7 +630,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # docs / stylesheets / templates / configs end up typed as code
         # modules. Only the generic "module" label is coerced — richer
         # model-chosen types (component/service/...) are kept as-is.
-        expected_type, _ = self._file_entity_kind(Path(rel_path).suffix)
+        expected_type, _ = self._file_entity_kind(Path(rel_path).name)
         if expected_type != "module":
             for entity in entities:
                 if entity.get("name") == rel_path and entity.get("type") == "module":
@@ -659,12 +667,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
     @staticmethod
     def _file_entity_kind(suffix: str) -> tuple[str, str]:
-        """Pick the file-entity (type, description) from the extension.
+        """Pick the file-entity (type, description) from the extension OR
+        full filename.
 
         Used for the auto-created file node in ``write_batch`` — a .md is a
-        doc, a .scss is a style, NOT a code "module".
+        doc, a .scss is a style, NOT a code "module". Accepts either a bare
+        suffix (".md") or a filename (".env.example", "config.yaml") — env
+        files have no meaningful ``Path.suffix`` (".env" → "", ".env.local"
+        → ".local"), so callers should pass the full name when available.
         """
         s = suffix.lower()
+        base = s.rsplit("/", 1)[-1]
+        if base.startswith(".env") or base.endswith(".env"):
+            return "config", "Environment configuration file"
+        if "." in base[1:]:
+            s = "." + base.rsplit(".", 1)[-1]
         if s in {".css", ".scss", ".sass", ".less"}:
             return "style", "Stylesheet file"
         if s in {".html", ".htm", ".vue", ".svelte", ".astro"}:
@@ -1168,7 +1185,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # Only for full-file writes (entities present); additive reverse-grep
         # writes (entities=[]) must not resurrect a wiped file node.
         if entities and not any(e.get("name") == rel for e in raw_entities if isinstance(e, dict)):
-            raw_entities.append(self._make_file_entity(rel, *self._file_entity_kind(filepath.suffix)))
+            raw_entities.append(self._make_file_entity(rel, *self._file_entity_kind(filepath.name)))
         raw = {"entities": raw_entities, "relations": relations or []}
         data = self._sanitize_extracted(rel, raw)
 
