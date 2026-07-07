@@ -44,6 +44,9 @@ _ALLOWED_ENTITY_TYPES = {
     # would otherwise be invisible (path is a string literal at both
     # ends, not a Python/TS identifier).
     "endpoint",
+    # Documentation files (.md/.rst/.txt) — their file-entity must not
+    # masquerade as a code "module".
+    "doc",
 }
 
 _ALLOWED_RELATION_TYPES = {
@@ -614,6 +617,16 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         raw_entities = data.get("entities", []) if isinstance(data, dict) else []
         raw_relations = data.get("relations", []) if isinstance(data, dict) else []
         entities = self._enrich_entity_locations(rel_path, [e for e in raw_entities if isinstance(e, dict)])
+        # Coerce the FILE's own entity away from "module" on non-code files:
+        # build agents habitually label every file-entity "module", so .md
+        # docs / stylesheets / templates / configs end up typed as code
+        # modules. Only the generic "module" label is coerced — richer
+        # model-chosen types (component/service/...) are kept as-is.
+        expected_type, _ = self._file_entity_kind(Path(rel_path).suffix)
+        if expected_type != "module":
+            for entity in entities:
+                if entity.get("name") == rel_path and entity.get("type") == "module":
+                    entity["type"] = expected_type
         entity_names = {entity["name"] for entity in entities}
         # The file's own module-entity (its relpath) is an implicit, always-valid
         # endpoint: RAG-builder emits module-level edges (imports/calls) with
@@ -643,6 +656,24 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     @staticmethod
     def _make_file_entity(rel_path: str, entity_type: str, description: str) -> dict:
         return {"name": rel_path, "type": entity_type, "description": description}
+
+    @staticmethod
+    def _file_entity_kind(suffix: str) -> tuple[str, str]:
+        """Pick the file-entity (type, description) from the extension.
+
+        Used for the auto-created file node in ``write_batch`` — a .md is a
+        doc, a .scss is a style, NOT a code "module".
+        """
+        s = suffix.lower()
+        if s in {".css", ".scss", ".sass", ".less"}:
+            return "style", "Stylesheet file"
+        if s in {".html", ".htm", ".vue", ".svelte", ".astro"}:
+            return "template", "Template file"
+        if s in {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env"}:
+            return "config", "Configuration file"
+        if s in {".md", ".rst", ".txt", ".adoc"}:
+            return "doc", "Documentation file"
+        return "module", "Module file"
 
     def _extract_stylesheet(self, rel_path: str, code: str) -> dict:
         entities = [self._make_file_entity(rel_path, "style", "Stylesheet file")]
@@ -1063,6 +1094,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             # handlers and <component-selector> references, Vue/Svelte
             # carry script + template + event handlers in one file.
             ".html", ".vue", ".svelte",
+            # Stylesheets: their selectors/variables are referenced from
+            # markup and other stylesheets — reverse-grep incoming edges
+            # (styleUrls, @import, class usage) apply the same way.
+            ".css", ".scss", ".sass", ".less",
         }
         if entities and not relations and filepath.suffix.lower() in _CODE_EXTS:
             return {
@@ -1133,7 +1168,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # Only for full-file writes (entities present); additive reverse-grep
         # writes (entities=[]) must not resurrect a wiped file node.
         if entities and not any(e.get("name") == rel for e in raw_entities if isinstance(e, dict)):
-            raw_entities.append(self._make_file_entity(rel, "module", "Module file"))
+            raw_entities.append(self._make_file_entity(rel, *self._file_entity_kind(filepath.suffix)))
         raw = {"entities": raw_entities, "relations": relations or []}
         data = self._sanitize_extracted(rel, raw)
 
@@ -1144,7 +1179,11 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # ``needs_incoming`` and the sub-agent is forced to come back with a
         # reverse-grep write. A completion write (entities=[], the model has
         # done the grep) or any non-code / additive write clears the flag.
-        code_ext = filepath.suffix.lower() in _CODE_EXTS
+        # The reverse-grep gate covers stylesheets too: "who imports/uses
+        # this .scss" is a real incoming edge (component styleUrls, @import
+        # chains) even though R3 doesn't demand outgoing relations for them.
+        _GATE_EXTS = _CODE_EXTS | {".css", ".scss", ".sass", ".less"}
+        code_ext = filepath.suffix.lower() in _GATE_EXTS
         flag_ignored = False
         if entities and code_ext:
             # HARD GATE: ``incoming_complete=True`` on the INITIAL full write
