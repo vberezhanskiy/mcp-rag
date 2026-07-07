@@ -1116,7 +1116,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             # (styleUrls, @import, class usage) apply the same way.
             ".css", ".scss", ".sass", ".less",
         }
-        if entities and not relations and filepath.suffix.lower() in _CODE_EXTS:
+        # A "module-only" write carries just the file's own entity (name ==
+        # relpath) and nothing else — the sanctioned way to register a
+        # machine-generated code file (minified bundle, migration snapshot)
+        # without studying it. Exempt from R3 and from the reverse-grep gate:
+        # there are no definitions to demand relations for or to grep.
+        module_only = bool(entities) and all(
+            isinstance(e, dict) and e.get("name") == rel for e in entities
+        )
+        if entities and not relations and not module_only and filepath.suffix.lower() in _CODE_EXTS:
             return {
                 "file": rel,
                 "entities": 0,
@@ -1202,7 +1210,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         _GATE_EXTS = _CODE_EXTS | {".css", ".scss", ".sass", ".less"}
         code_ext = filepath.suffix.lower() in _GATE_EXTS
         flag_ignored = False
-        if entities and code_ext:
+        if entities and code_ext and not module_only:
             # HARD GATE: ``incoming_complete=True`` on the INITIAL full write
             # is ignored. Build agents learned to set the flag upfront and
             # skip the reverse-grep phase entirely — the whole graph then
