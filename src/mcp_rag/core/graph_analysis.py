@@ -290,9 +290,19 @@ class GraphAnalysisMixin:
             for r in rows[:limit]
         ]
 
-    _DEF_LINE_RE = (
+    # A line only counts as the DEFINITION of <name> when the name follows
+    # the declaring keyword directly (``def name``, ``const name =``).
+    # A generic "line starts with const/def" check is NOT enough: usage
+    # lines like ``const ready = await waitForAgent();`` start with a
+    # declaring keyword too, and treating them as definitions made the
+    # verifier skip real call sites (false "dead" claims).
+    _DEF_LINE_TMPL = (
         r"^\s*(?:export\s+(?:default\s+)?)?(?:public\s+|private\s+|protected\s+|static\s+|abstract\s+)*"
-        r"(?:async\s+)?(?:def|class|function|interface|type|enum|const|let|var|fn|func)\b"
+        r"(?:async\s+)?"
+        r"(?:(?:def|class|function|interface|type|enum|fn|func)\s+{name}\b"
+        r"|(?:const|let|var)\s+{name}\s*[=:(]"
+        r"|{name}\s*[:=]\s*(?:async\s+)?(?:function\b|\()"
+        r")"
     )
 
     def _verify_dead_candidates(self, rows: list, cap: int = 500) -> list:
@@ -301,7 +311,6 @@ class GraphAnalysisMixin:
         search = getattr(self, "search_regex", None)
         if search is None:
             return rows
-        def_line = _re.compile(self._DEF_LINE_RE)
         kept = []
         for r in rows[:cap]:
             file, name, line_start = r[0], r[1], r[4]
@@ -321,6 +330,7 @@ class GraphAnalysisMixin:
                 kept.append(r)
                 continue
             word_re = _re.compile(rf"\b{_re.escape(bare)}\b")
+            def_re = _re.compile(self._DEF_LINE_TMPL.format(name=_re.escape(bare)))
             alive = False
             for m in out.get("matches", []):
                 ctx = (m.get("context") or "").strip()
@@ -329,8 +339,8 @@ class GraphAnalysisMixin:
                 # its own definition (same file, at/near the recorded line)
                 if m.get("file") == file and line_start and abs((m.get("line") or 0) - line_start) <= 2:
                     continue
-                # any definition-shaped line that declares this name
-                if def_line.match(ctx) and _re.search(rf"\b{_re.escape(bare)}\b", ctx.split("(")[0]):
+                # a line that DECLARES this exact name (any file)
+                if def_re.match(ctx):
                     continue
                 # comment-only lines
                 if ctx.startswith(("#", "//", "*", "/*", "<!--", '"""', "'''")):
