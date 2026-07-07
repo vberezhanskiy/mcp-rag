@@ -592,6 +592,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 continue
             if entity_names and from_name not in entity_names and to_name not in entity_names:
                 continue
+            # A file cannot "define" ANOTHER file — build agents sometimes emit
+            # junk module→module defines edges (e.g. test_a.py defines
+            # test_b.py), which pollute find_usages/explain output. "defines"
+            # is strictly "this file defines an entity that lives in it".
+            if (
+                rel_type == "defines"
+                and to_name != rel_path
+                and re.search(
+                    r"\.(py|pyi|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|scala|cs|cpp|cc|c|h|hpp|rb|php|swift|html|htm|vue|svelte|css|scss|json|ya?ml|toml|md)$",
+                    to_name.rsplit("/", 1)[-1],
+                    re.IGNORECASE,
+                )
+            ):
+                logger.debug("dropping cross-file defines edge: %s -> %s (%s)", from_name, to_name, rel_path)
+                continue
             sanitized.append({"from": from_name, "relation": rel_type, "to": to_name})
         return sanitized
 
@@ -1130,7 +1145,16 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # reverse-grep write. A completion write (entities=[], the model has
         # done the grep) or any non-code / additive write clears the flag.
         code_ext = filepath.suffix.lower() in _CODE_EXTS
-        if entities and code_ext and not incoming_complete:
+        flag_ignored = False
+        if entities and code_ext:
+            # HARD GATE: ``incoming_complete=True`` on the INITIAL full write
+            # is ignored. Build agents learned to set the flag upfront and
+            # skip the reverse-grep phase entirely — the whole graph then
+            # lacks incoming call edges (find_usages returns nothing for the
+            # most-used functions). The reverse-grep can only be truthful
+            # AFTER the definitions have been written, so completion must be
+            # a separate follow-up write (entities=[]).
+            flag_ignored = bool(incoming_complete)
             incoming_done = 0
         else:
             incoming_done = 1
@@ -1160,6 +1184,12 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             ]
             result["needs_incoming"] = True
             result["grep_names"] = def_names
+            if flag_ignored:
+                result["incoming_complete_ignored"] = (
+                    "incoming_complete=True is not accepted on the initial "
+                    "full write — do the reverse-grep first, then submit a "
+                    "separate completion write (entities=[])."
+                )
             result["next_action"] = (
                 f"NOT DONE with {rel}: now grep these definitions project-wide and "
                 f"record their INCOMING edges (who calls/uses/instantiates them), then "
