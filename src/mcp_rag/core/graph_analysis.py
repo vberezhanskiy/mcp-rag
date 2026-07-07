@@ -10,6 +10,7 @@ which ``CodeGraph`` provides.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections import defaultdict
 from typing import Optional
@@ -83,7 +84,7 @@ class GraphAnalysisMixin:
             return {
                 "anchor": entity_name,
                 "results": [],
-                "warning": "Graph FAISS index is empty — run graph_build first.",
+                "warning": "Graph FAISS index is empty — run rag_rebuild first.",
             }
 
         type_filter = set(entity_types) if entity_types else set(self._PRIMARY_DEF_TYPES)
@@ -261,6 +262,17 @@ class GraphAnalysisMixin:
             from fnmatch import fnmatch
             rows = [r for r in rows if not any(fnmatch(r[0], g) for g in exclude_paths)]
 
+        # Test functions are dispatched by the framework (pytest/jest collect
+        # them by NAME pattern, never by an explicit call) — every test_*
+        # definition would be flagged dead forever. Drop entities defined in
+        # test files; "is this test dead?" is not a question this tool can
+        # answer from the call graph.
+        _t = re.compile(
+            r"(^|/)(tests?|__tests__)/|(^|/)test_[^/]+$|[._-](test|spec)\.[a-z]+$|_test\.[a-z]+$",
+            re.IGNORECASE,
+        )
+        rows = [r for r in rows if not _t.search(r[0].replace("\\", "/"))]
+
         # CONTENT VERIFICATION: the graph's incoming edges are only as good
         # as the build agent's reverse-grep diligence — same-file calls and
         # by-reference usages (tool registries, callbacks, lambdas) are
@@ -350,7 +362,7 @@ class GraphAnalysisMixin:
         if self.faiss_index is None or not self.faiss_names or self._faiss_dirty:
             self._rebuild_faiss()
         if self.faiss_index is None or self.faiss_index.ntotal == 0:
-            return {"clusters": [], "warning": "Graph FAISS index is empty — run graph_build first."}
+            return {"clusters": [], "warning": "Graph FAISS index is empty — run rag_rebuild first."}
 
         types = set(entity_types) if entity_types else set(self._PRIMARY_DEF_TYPES)
 
@@ -363,7 +375,7 @@ class GraphAnalysisMixin:
             ).fetchall()
 
         if len(all_entities) != len(self.faiss_names):
-            return {"clusters": [], "warning": "FAISS index out of sync; run graph_build."}
+            return {"clusters": [], "warning": "FAISS index out of sync; run rag_rebuild."}
 
         shape_map: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
         for f, fn, r, tn in rels_rows:
@@ -674,7 +686,7 @@ class GraphAnalysisMixin:
             )
 
         if not ent_rows:
-            return {"markdown": "", "warning": "Graph is empty — run graph_build first.", "selected_count": 0}
+            return {"markdown": "", "warning": "Graph is empty — run rag_rebuild first.", "selected_count": 0}
 
         graph = nx.DiGraph()
         ent_by_key: dict[tuple[str, str], dict] = {}

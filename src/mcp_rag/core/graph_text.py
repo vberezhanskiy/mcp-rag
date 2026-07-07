@@ -98,7 +98,12 @@ class GraphTextMixin:
         """
         self._ensure_text_index()
 
-        literal_runs = re.findall(r"[A-Za-z0-9_]{3,}", pattern)
+        # Strip regex escape sequences BEFORE extracting literal runs:
+        # in r"\bstartAgentWorker\b" the 'b' of \b is alphanumeric and glues
+        # onto the literal, producing the FTS term "bstartAgentWorker" which
+        # matches nothing. Replace every backslash-escape with a separator.
+        literal_src = re.sub(r"\\[A-Za-z]", " ", pattern)
+        literal_runs = re.findall(r"[A-Za-z0-9_]{3,}", literal_src)
         if not literal_runs:
             return {
                 "matches": [],
