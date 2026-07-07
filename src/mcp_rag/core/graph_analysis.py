@@ -261,11 +261,74 @@ class GraphAnalysisMixin:
             from fnmatch import fnmatch
             rows = [r for r in rows if not any(fnmatch(r[0], g) for g in exclude_paths)]
 
+        # CONTENT VERIFICATION: the graph's incoming edges are only as good
+        # as the build agent's reverse-grep diligence — same-file calls and
+        # by-reference usages (tool registries, callbacks, lambdas) are
+        # chronically under-recorded, producing false "dead" claims. Trust
+        # the actual file content instead: a candidate with a bare-name
+        # match in the FTS index that is neither its own definition line nor
+        # a comment is ALIVE and gets dropped. Biases toward "alive"
+        # (string/docstring mentions also count) — correct bias for a tool
+        # whose output people act on by deleting code.
+        rows = self._verify_dead_candidates(rows)
+
         return [
             {"file": r[0], "name": r[1], "type": r[2], "description": r[3],
              "line_start": r[4], "line_end": r[5], "snippet": r[6] or ""}
             for r in rows[:limit]
         ]
+
+    _DEF_LINE_RE = (
+        r"^\s*(?:export\s+(?:default\s+)?)?(?:public\s+|private\s+|protected\s+|static\s+|abstract\s+)*"
+        r"(?:async\s+)?(?:def|class|function|interface|type|enum|const|let|var|fn|func)\b"
+    )
+
+    def _verify_dead_candidates(self, rows: list, cap: int = 500) -> list:
+        """Drop dead-code candidates that file content proves alive."""
+        import re as _re
+        search = getattr(self, "search_regex", None)
+        if search is None:
+            return rows
+        def_line = _re.compile(self._DEF_LINE_RE)
+        kept = []
+        for r in rows[:cap]:
+            file, name, line_start = r[0], r[1], r[4]
+            if not name or not _re.match(r"^[\w$.]+$", name):
+                kept.append(r)          # unsafe to regex-verify — keep as-is
+                continue
+            bare = name.rsplit(".", 1)[-1]  # method names stored as Cls.meth
+            if len(bare) < 3:
+                kept.append(r)
+                continue
+            try:
+                # NB: no \b in the pattern — the FTS trigram pre-filter treats
+                # regex meta-chars poorly and returns nothing. Query the bare
+                # name and enforce the word boundary client-side.
+                out = search(pattern=_re.escape(bare), limit=60)
+            except Exception:
+                kept.append(r)
+                continue
+            word_re = _re.compile(rf"\b{_re.escape(bare)}\b")
+            alive = False
+            for m in out.get("matches", []):
+                ctx = (m.get("context") or "").strip()
+                if not word_re.search(ctx):
+                    continue
+                # its own definition (same file, at/near the recorded line)
+                if m.get("file") == file and line_start and abs((m.get("line") or 0) - line_start) <= 2:
+                    continue
+                # any definition-shaped line that declares this name
+                if def_line.match(ctx) and _re.search(rf"\b{_re.escape(bare)}\b", ctx.split("(")[0]):
+                    continue
+                # comment-only lines
+                if ctx.startswith(("#", "//", "*", "/*", "<!--", '"""', "'''")):
+                    continue
+                alive = True
+                break
+            if not alive:
+                kept.append(r)
+        kept.extend(rows[cap:])
+        return kept
 
     def find_clones(
         self,
