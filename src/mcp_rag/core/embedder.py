@@ -97,8 +97,17 @@ def _detect_device() -> str:
         return forced
     try:
         import torch
-        if torch.cuda.is_available():
-            return "cuda"
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            # is_available() can lie on machines where the NVIDIA driver is
+            # installed but no usable GPU is present (or the dGPU is powered
+            # down) — the first real allocation then dies with "No CUDA GPUs
+            # are available" deep inside encode(). Probe with a tiny
+            # allocation before committing to cuda.
+            try:
+                torch.zeros(1, device="cuda")
+                return "cuda"
+            except Exception as e:
+                logger.warning("CUDA reported available but unusable (%s) — falling back to CPU", e)
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             return "mps"
     except Exception as e:
