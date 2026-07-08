@@ -49,6 +49,73 @@ _ALLOWED_ENTITY_TYPES = {
     "doc",
 }
 
+# Synonyms the LLM extractor is known to emit → canonical type. Applied
+# BEFORE the allowlist check, so the model can write naturally ("struct",
+# "route", "fn") without its label being flattened to ``symbol``. A label
+# that resolves to nothing here AND is not canonical is stored as
+# type='symbol' with the original label preserved as a searchable tag
+# (see _enrich_entity_locations) — the category is never silently lost.
+_ENTITY_TYPE_ALIASES = {
+    # functions
+    "fn": "function", "func": "function", "procedure": "function",
+    "subroutine": "function", "lambda": "function", "closure": "function",
+    "callback": "function", "generator": "function", "coroutine": "function",
+    "decorator": "function", "handler": "function", "helper": "function",
+    "util": "function", "utility": "function", "validator": "function",
+    "test": "function", "test_case": "function", "spec": "function",
+    "macro": "function",
+    # classes
+    "struct": "class", "structure": "class", "dataclass": "class",
+    "record": "class", "model": "class", "exception": "class",
+    "mixin": "class",
+    # interfaces
+    "protocol": "interface", "trait": "interface",
+    "abstract_class": "interface",
+    # type aliases / shapes
+    "type_alias": "type", "typedef": "type", "typealias": "type",
+    "dto": "type", "schema": "type", "union": "type",
+    # enums
+    "enumeration": "enum", "enum_class": "enum",
+    # constants / variables
+    "const": "constant", "define": "constant", "literal": "constant",
+    "var": "variable", "field": "variable", "attribute": "variable",
+    "member": "variable", "global": "variable", "signal": "variable",
+    "state": "variable", "store": "variable",
+    # properties
+    "prop": "property", "getter": "property", "setter": "property",
+    "accessor": "property",
+    # endpoints (cross-boundary strings: routes, channels, events)
+    "route": "endpoint", "api": "endpoint", "api_endpoint": "endpoint",
+    "rest_endpoint": "endpoint", "url": "endpoint", "websocket": "endpoint",
+    "channel": "endpoint", "topic": "endpoint", "queue": "endpoint",
+    "event": "endpoint",
+    # modules
+    "mod": "module", "package": "module", "namespace": "module",
+    "file": "module", "script": "module", "library": "module",
+    # components
+    "widget": "component", "view": "component", "page": "component",
+    "screen": "component", "fragment": "component", "element": "component",
+    # services (DI-managed / framework-wired classes)
+    "provider": "service", "repository": "service", "dao": "service",
+    "manager": "service", "client": "service", "gateway": "service",
+    "middleware": "service", "guard": "service", "interceptor": "service",
+    "resolver": "service", "worker": "service", "job": "service",
+    "scheduler": "service",
+    # styles / templates / config / docs
+    "stylesheet": "style", "css": "style", "scss": "style",
+    "css_class": "style",
+    "markup": "template", "layout": "template", "partial": "template",
+    "configuration": "config", "settings": "config", "setting": "config",
+    "env": "config", "environment": "config", "manifest": "config",
+    "option": "config", "cfg": "config", "conf": "config",
+    "documentation": "doc", "docs": "doc", "readme": "doc",
+    "markdown": "doc", "guide": "doc", "docstring": "doc",
+    # hooks
+    "composable": "hook",
+    # imports
+    "dependency": "import", "require": "import", "include": "import",
+}
+
 _ALLOWED_RELATION_TYPES = {
     "defines", "calls", "imports", "inherits", "uses", "instantiates",
 }
@@ -487,6 +554,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     con.commit()
                     logger.info("Back-filled traits for %d existing entities.", updated)
 
+    def _is_indexable_file(self, path: Path) -> bool:
+        """True when the file's suffix is in the indexable set
+        (``_CODE_EXTENSIONS`` + per-project ``extra_extensions``).
+
+        Gate for the WRITE path (write_batch / add_entity / add_relation):
+        the discovery side (_get_files) already filters by suffix, but an
+        LLM-driven builder sub-agent enumerates files via its own
+        ``list_files`` and will happily submit binary assets it stumbled
+        on (mock PDFs, images, fonts) — those must never become graph
+        nodes, or they surface as bogus "modules" in stats/visualization.
+        """
+        suffixes = {ext.lstrip("*").lower() for ext in (_CODE_EXTENSIONS + self._extra_extensions)}
+        fname = path.name.lower()
+        return any(fname.endswith(suffix) for suffix in suffixes)
+
     def _should_ignore(self, path: Path) -> bool:
         if self._gitignore_parser is not None:
             try:
@@ -572,14 +654,43 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         cleaned = " ".join((text or "").strip().split())
         return cleaned[:limit]
 
+    @staticmethod
+    def _sanitize_tags(raw) -> list[str]:
+        """Normalize caller-supplied free-form tags to trait tokens.
+
+        Accepts a list or a comma/space-separated string. Tokens are
+        lowercased, non-alphanumerics collapse to ``-``, capped at 24
+        chars each and 8 tags total. The result plugs directly into the
+        space-separated ``traits`` column, so tags are queryable via
+        ``find_by_trait`` alongside auto-detected traits.
+        """
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            raw = re.split(r"[,\s]+", raw)
+        out: list[str] = []
+        for t in list(raw)[:8]:
+            tok = re.sub(r"[^a-z0-9_-]+", "-", str(t).strip().lower()).strip("-")[:24]
+            if tok and tok not in out:
+                out.append(tok)
+        return out
+
     def _enrich_entity_locations(self, rel_path: str, entities: list[dict]) -> list[dict]:
         enriched = []
         for entity in entities:
             name = self._normalize_whitespace(str(entity.get("name", "")), limit=160)
             if not name:
                 continue
-            entity_type = self._normalize_whitespace(str(entity.get("type", "")), limit=40).lower() or "symbol"
+            raw_type = self._normalize_whitespace(str(entity.get("type", "")), limit=40).lower()
+            entity_type = _ENTITY_TYPE_ALIASES.get(raw_type, raw_type) or "symbol"
+            tags = self._sanitize_tags(entity.get("tags"))
             if entity_type not in _ALLOWED_ENTITY_TYPES:
+                # Free-form category from the model: keep it as a tag so
+                # the label survives (queryable via find_by_trait) even
+                # though the canonical type column falls back to symbol.
+                for tok in self._sanitize_tags(raw_type):
+                    if tok not in tags:
+                        tags.append(tok)
                 entity_type = "symbol"
             description = self._normalize_whitespace(str(entity.get("description", "")), limit=300)
             snippet_info = self._find_entity_snippet(rel_path, name)
@@ -590,6 +701,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 "line_start": snippet_info["line_start"],
                 "line_end": snippet_info["line_end"],
                 "snippet": snippet_info["snippet"],
+                "tags": tags,
             })
         return enriched
 
@@ -940,9 +1052,12 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     def _store_extracted(self, rel_path: str, mtime: float, data: dict, incoming_done: int = 1) -> None:
         with sqlite3.connect(self.db_path) as con:
             for e in data.get("entities", []):
-                traits = self._detect_traits(
+                detected = self._detect_traits(
                     e.get("name", ""), e.get("snippet", ""), rel_path, e.get("type", ""),
                 )
+                # Caller-supplied tags (sanitized in _enrich_entity_locations)
+                # merge with auto-detected traits into one queryable string.
+                traits = " ".join(sorted(set(detected.split()) | set(e.get("tags") or [])))
                 # ON CONFLICT preserves richer description/snippet from an
                 # earlier indexing pass when this re-insert carries empty
                 # text — see add_entity for the same pattern and rationale.
@@ -997,6 +1112,9 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # through the LLM extractor even when not stale. Since the LLM is the
         # only source-code extractor now, this is mostly a "re-index even if
         # mtime matches" override.
+        if not self._is_indexable_file(filepath):
+            logger.info("index_file: %s has a non-indexable extension, skipping", filepath.name)
+            return
         if not force_llm and not self._file_needs_update(filepath):
             return
         rel = filepath.relative_to(self.project_root).as_posix()
@@ -1086,14 +1204,35 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not filepath.is_absolute():
             filepath = self.project_root / filepath
         rel = filepath.relative_to(self.project_root).as_posix()
+        if not self._is_indexable_file(filepath):
+            # Also purge any rows a previous (pre-gate) build managed to
+            # write for this asset — otherwise the file stays "missing"
+            # in get_pending_files forever, since the write path is now
+            # closed for it and no other deletion path exists.
+            logger.info("write_batch: %s has a non-indexable extension, rejecting", rel)
+            self._delete_file_data(rel)
+            return {
+                "file": rel, "entities": 0, "relations": 0,
+                "skipped": (
+                    "unsupported_extension: binary/asset files (pdf, images, "
+                    "fonts, archives, ...) are not part of the code graph — "
+                    "do not index this file, move on."
+                ),
+            }
         try:
             mtime = filepath.stat().st_mtime
         except OSError:
-            # File got deleted between the sub-agent's read and this write.
-            # Skip — _cleanup_deleted_files on the next graph_build will
-            # take care of any stale entries.
-            logger.warning("write_batch: %s vanished from disk, skipping", rel)
-            return {"file": rel, "entities": 0, "relations": 0, "skipped": "file_not_found"}
+            # File is gone from disk. Purge its graph rows right here —
+            # this is the ONLY deletion path available to a RAG-builder
+            # sub-agent (it has no graph_clear), so without the purge a
+            # "missing" entry in get_pending_files can never be cleared
+            # and the build loop spins forever on it.
+            logger.warning("write_batch: %s vanished from disk, purging its graph rows", rel)
+            self._delete_file_data(rel)
+            return {
+                "file": rel, "entities": 0, "relations": 0,
+                "skipped": "file_not_found — stale graph rows purged, file no longer pending",
+            }
 
         # R3 enforcement: code-extension file with entities but ZERO relations
         # means the caller skipped the import block (every code file has
@@ -1277,6 +1416,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         name: str,
         type: str,
         description: str = "",
+        tags: "Optional[list[str]]" = None,
     ) -> dict:
         """Add a single entity to the graph WITHOUT wiping the file's
         existing rows. Idempotent — the entities table has a UNIQUE
@@ -1300,6 +1440,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not filepath.is_absolute():
             filepath = self.project_root / filepath
         rel = filepath.relative_to(self.project_root).as_posix()
+        if not self._is_indexable_file(filepath):
+            return {
+                "file": rel, "added": 0,
+                "skipped": (
+                    "unsupported_extension: binary/asset files are not part "
+                    "of the code graph — do not index this file, move on."
+                ),
+            }
         try:
             mtime = filepath.stat().st_mtime
         except OSError:
@@ -1310,7 +1458,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # validates entity type against _ALLOWED_ENTITY_TYPES and
         # enriches line/snippet.
         sanitized = self._sanitize_extracted(rel, {
-            "entities": [{"name": name, "type": type, "description": description}],
+            "entities": [{"name": name, "type": type, "description": description, "tags": tags}],
             "relations": [],
         })
         if not sanitized["entities"]:
@@ -1327,9 +1475,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 (rel, rel, "module", "Source file"),
             )
             for e in sanitized["entities"]:
-                traits = self._detect_traits(
+                detected = self._detect_traits(
                     e.get("name", ""), e.get("snippet", ""), rel, e.get("type", ""),
                 )
+                traits = " ".join(sorted(set(detected.split()) | set(e.get("tags") or [])))
                 # Use ON CONFLICT (not INSERT OR REPLACE) so a re-insert with
                 # empty description/snippet does NOT overwrite the richer text
                 # captured by an earlier pass. Common scenario: the primary
@@ -1402,6 +1551,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not filepath.is_absolute():
             filepath = self.project_root / filepath
         rel = filepath.relative_to(self.project_root).as_posix()
+        if not self._is_indexable_file(filepath):
+            return {
+                "file": rel, "added": 0,
+                "skipped": (
+                    "unsupported_extension: binary/asset files are not part "
+                    "of the code graph — do not index this file, move on."
+                ),
+            }
 
         from_name = self._normalize_whitespace(str(from_name or ""), limit=160)
         to_name = self._normalize_whitespace(str(to_name or ""), limit=160)
@@ -1440,14 +1597,27 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
         Returns:
             ``{"entity_types": sorted[str],
-               "relation_types": sorted[str]}``
+               "relation_types": sorted[str],
+               "type_aliases": {synonym: canonical},
+               "tags": <free-form tags contract>}``
 
-        Anything emitted with a type / relation outside these sets is
-        silently dropped by ``_sanitize_relations`` / sanitize-extracted.
+        Entity types are forgiving: a synonym from ``type_aliases``
+        resolves to its canonical type, and any other label is stored
+        as ``symbol`` with the original label preserved as a tag.
+        Relation types outside the set are still dropped.
         """
         return {
             "entity_types": sorted(_ALLOWED_ENTITY_TYPES),
             "relation_types": sorted(_ALLOWED_RELATION_TYPES),
+            "type_aliases": dict(sorted(_ENTITY_TYPE_ALIASES.items())),
+            "tags": (
+                "Entities accept an optional 'tags' list (short lowercase "
+                "labels, max 8) for free-form categorization. An entity type "
+                "outside entity_types/type_aliases is stored as type='symbol' "
+                "with the original label auto-preserved as a tag. Tags merge "
+                "with auto-detected traits and are queryable via "
+                "graph_filter_by_trait."
+            ),
         }
 
     def mark_stale(
