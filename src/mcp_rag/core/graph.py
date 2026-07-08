@@ -1123,6 +1123,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 (rel, mtime),
             )
 
+    async def _extract_with_strategy(
+        self, filepath: Path, code: str, force_llm: bool = False
+    ) -> tuple[dict, str]:
+        """Run graph extraction for ``filepath`` through the LLM extractor.
+
+        Deterministic/tree-sitter parsers were removed: the background
+        agent-driven LLM extractor is the single source of graph data now,
+        so every indexable file routes through ``self.llm_extractor``.
+        Returns ``(raw_data, strategy)`` with a constant ``"llm"`` strategy
+        (kept for the caller's store/retry branching in ``index_file``).
+        """
+        rel_path = filepath.relative_to(self.project_root).as_posix()
+        data = await self.llm_extractor.extract(rel_path, code)
+        return data, "llm"
+
     async def index_file(self, filepath: Path, force_llm: bool = False) -> None:
         # ``force_llm`` bypasses the freshness check: the file is re-indexed
         # through the LLM extractor even when not stale. Since the LLM is the
