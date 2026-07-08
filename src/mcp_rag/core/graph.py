@@ -152,6 +152,19 @@ _CODE_EXTENSIONS = [
     "*.v", "*.sv", "*.vhdl", "*.vhd",
     "*.f", "*.f90", "*.f95",
     "*.gd", "*.gdshader", "*.gdshaderinc", "*.godot", "*.cfg",
+    # Extensionless / dotfile configs and build scripts. Same
+    # ``filename.endswith(...)`` matching as the .env variants above,
+    # so exact names work; "makefile" also catches "GNUmakefile",
+    # "dockerfile" also catches "dev.dockerfile".
+    ".gitignore", ".gitattributes", ".gitmodules", ".dockerignore",
+    ".npmrc", ".nvmrc", ".yarnrc",
+    ".prettierrc", ".prettierignore", ".editorconfig",
+    ".eslintrc", ".eslintignore", ".stylelintrc", ".babelrc",
+    ".browserslistrc",
+    "dockerfile", "makefile", "justfile", "rakefile", "gemfile",
+    "procfile", "jenkinsfile", "vagrantfile", "cmakelists.txt",
+    # Git hook scripts (.husky/*, .githooks/*) — extensionless shell.
+    "pre-commit", "pre-push", "commit-msg", "post-merge", "post-checkout",
 ]
 
 _IGNORE_DIRS = {
@@ -166,6 +179,9 @@ _IGNORE_DIRS = {
     ".gradle", "vendor", "CMakeFiles", "coverage", ".coverage",
     "htmlcoverage", ".tox", "buck-out", ".angular",
     ".godot", ".import", "addons",
+    # husky v9 keeps its machine-generated runner under .husky/_/ —
+    # the user's actual hook scripts live directly in .husky/.
+    "_",
 }
 
 # Files larger than this are skipped — typically minified bundles, lockfiles,
@@ -1214,9 +1230,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return {
                 "file": rel, "entities": 0, "relations": 0,
                 "skipped": (
-                    "unsupported_extension: binary/asset files (pdf, images, "
-                    "fonts, archives, ...) are not part of the code graph — "
-                    "do not index this file, move on."
+                    "unsupported_file_type: this file's extension is not in "
+                    "the graph's indexable list (binaries/assets like pdf, "
+                    "images, fonts, archives, or unrecognized formats) — do "
+                    "not index this file, move on."
                 ),
             }
         try:
@@ -1444,8 +1461,9 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return {
                 "file": rel, "added": 0,
                 "skipped": (
-                    "unsupported_extension: binary/asset files are not part "
-                    "of the code graph — do not index this file, move on."
+                    "unsupported_file_type: this file's extension is not in "
+                    "the graph's indexable list — do not index this file, "
+                    "move on."
                 ),
             }
         try:
@@ -1555,8 +1573,9 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return {
                 "file": rel, "added": 0,
                 "skipped": (
-                    "unsupported_extension: binary/asset files are not part "
-                    "of the code graph — do not index this file, move on."
+                    "unsupported_file_type: this file's extension is not in "
+                    "the graph's indexable list — do not index this file, "
+                    "move on."
                 ),
             }
 
