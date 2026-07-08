@@ -282,7 +282,11 @@ class GraphAnalysisMixin:
         # a comment is ALIVE and gets dropped. Biases toward "alive"
         # (string/docstring mentions also count) — correct bias for a tool
         # whose output people act on by deleting code.
-        rows = self._verify_dead_candidates(rows)
+        # ``needed=limit`` verifies incrementally until ``limit`` survivors
+        # are collected — NEVER appending an unverified tail (the old
+        # ``cap=500`` behavior silently passed candidates 501+ through
+        # unverified, which on big repos meant most of the output).
+        rows = self._verify_dead_candidates(rows, needed=limit)
 
         return [
             {"file": r[0], "name": r[1], "type": r[2], "description": r[3],
@@ -305,14 +309,30 @@ class GraphAnalysisMixin:
         r")"
     )
 
-    def _verify_dead_candidates(self, rows: list, cap: int = 500) -> list:
-        """Drop dead-code candidates that file content proves alive."""
+    def _verify_dead_candidates(
+        self, rows: list, needed: Optional[int] = None, max_checks: int = 2000
+    ) -> list:
+        """Drop dead-code candidates that file content proves alive.
+
+        ``needed`` stops the scan once that many candidates survived —
+        bounds FTS work to roughly ``needed + <false positives seen>``
+        searches instead of verifying the whole over-fetched list.
+        ``max_checks`` is a hard ceiling on FTS searches; when hit, the
+        REMAINING rows are dropped, not passed through unverified — an
+        unverified "dead" claim is worse than a shorter list (people
+        delete code based on this output).
+        """
         import re as _re
         search = getattr(self, "search_regex", None)
         if search is None:
             return rows
         kept = []
-        for r in rows[:cap]:
+        checks = 0
+        for r in rows:
+            if needed is not None and len(kept) >= needed:
+                break
+            if checks >= max_checks:
+                break
             file, name, line_start = r[0], r[1], r[4]
             if not name or not _re.match(r"^[\w$.]+$", name):
                 kept.append(r)          # unsafe to regex-verify — keep as-is
@@ -321,11 +341,15 @@ class GraphAnalysisMixin:
             if len(bare) < 3:
                 kept.append(r)
                 continue
+            checks += 1
             try:
-                # NB: no \b in the pattern — the FTS trigram pre-filter treats
-                # regex meta-chars poorly and returns nothing. Query the bare
-                # name and enforce the word boundary client-side.
-                out = search(pattern=_re.escape(bare), limit=60)
+                # Word-boundary in the FTS query itself (the literal
+                # extractor handles \b since the regex-escape fix). Without
+                # it a short name like "ref" saturates the 60-match window
+                # with substring hits (href/referrer/references) and the
+                # real call sites never reach the client-side filter —
+                # the candidate then reads falsely dead.
+                out = search(pattern=rf"\b{_re.escape(bare)}\b", limit=60)
             except Exception:
                 kept.append(r)
                 continue
@@ -349,7 +373,6 @@ class GraphAnalysisMixin:
                 break
             if not alive:
                 kept.append(r)
-        kept.extend(rows[cap:])
         return kept
 
     def find_clones(
