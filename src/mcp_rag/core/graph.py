@@ -749,7 +749,12 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             sanitized.append({"from": from_name, "relation": rel_type, "to": to_name})
         return sanitized
 
-    def _sanitize_extracted(self, rel_path: str, data: dict) -> dict:
+    def _sanitize_extracted(
+        self,
+        rel_path: str,
+        data: dict,
+        extra_entity_names: "set[str] | None" = None,
+    ) -> dict:
         raw_entities = data.get("entities", []) if isinstance(data, dict) else []
         raw_relations = data.get("relations", []) if isinstance(data, dict) else []
         entities = self._enrich_entity_locations(rel_path, [e for e in raw_entities if isinstance(e, dict)])
@@ -770,6 +775,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # drop every such edge (neither endpoint in the batch's entity set),
         # leaving files as "N entities, 0 relations".
         entity_names.add(rel_path)
+        # Additive writes (reverse-grep completion: entities=[]) validate
+        # against the file's ALREADY-STORED entities, passed in by the caller.
+        # Without this every incoming edge (from=caller elsewhere, to=this
+        # file's definition) had neither endpoint in the batch's entity set
+        # and was silently dropped — the whole reverse-grep phase stored
+        # nothing, so find_usages saw no callers and dead-code analysis
+        # flagged well-used definitions.
+        if extra_entity_names:
+            entity_names |= extra_entity_names
         relations = self._sanitize_relations(rel_path, [r for r in raw_relations if isinstance(r, dict)], entity_names)
         return {"entities": entities, "relations": relations}
 
@@ -1348,6 +1362,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # flips the completion flag). Such a call must NOT wipe the file —
         # even when it carries zero relations (``incoming_complete=True`` with
         # nothing found).
+        stored_names: set[str] = set()
         if entities:
             self._delete_file_data(rel)
         else:
@@ -1356,6 +1371,16 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 "incoming_complete=%s) — additive reverse-grep write, skipping wipe",
                 rel, len(relations or []), incoming_complete,
             )
+            # Incoming edges point AT this file's previously-stored
+            # definitions — sanitize must accept those names as valid
+            # endpoints (the batch itself carries no entities).
+            with sqlite3.connect(self.db_path) as con:
+                stored_names = {
+                    row[0]
+                    for row in con.execute(
+                        "SELECT name FROM entities WHERE file = ?", (rel,)
+                    )
+                }
 
         raw_entities = list(entities or [])
         # Ensure the file's own module-entity exists as a graph node, so the
@@ -1366,7 +1391,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if entities and not any(e.get("name") == rel for e in raw_entities if isinstance(e, dict)):
             raw_entities.append(self._make_file_entity(rel, *self._file_entity_kind(filepath.name)))
         raw = {"entities": raw_entities, "relations": relations or []}
-        data = self._sanitize_extracted(rel, raw)
+        data = self._sanitize_extracted(rel, raw, extra_entity_names=stored_names)
 
         # ── Per-file reverse-grep gate ──────────────────────────────────────
         # A full-file write of a CODE file is NOT considered finished until
@@ -1408,6 +1433,17 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             "entities": len(data["entities"]),
             "relations": len(data["relations"]),
         }
+        # Surface sanitize drops instead of failing silently — a completion
+        # write whose edges ALL failed validation used to look like success
+        # ("0 relations") while the reverse-grep data was lost.
+        dropped = len(relations or []) - len(data["relations"])
+        if dropped > 0:
+            result["relations_dropped"] = dropped
+            result["dropped_hint"] = (
+                "relations failed validation: unknown relation type, or "
+                "neither endpoint is an entity of this file/batch — check "
+                "the names against this file's definitions and graph_schema"
+            )
         # Hand the model an explicit, per-file next action so the gate is
         # self-documenting: it learns the reverse-grep protocol from the tool
         # response itself, not just the system prompt.
