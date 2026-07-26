@@ -167,6 +167,15 @@ _CODE_EXTENSIONS = [
     "pre-commit", "pre-push", "commit-msg", "post-merge", "post-checkout",
 ]
 
+# Расширения, по которым имя сущности опознаётся как ПУТЬ К ФАЙЛУ, а не
+# символ кода. Используется, чтобы не дать билдеру записать сущности одного
+# документа в батч другого (см. _looks_like_other_file). Берём набор
+# индексируемых расширений плюс инсталляторы/скрипты, которые в граф не
+# входят, но встречаются рядом и уезжают в чужой батч.
+_FILE_ENTITY_SUFFIXES = frozenset(
+    ext.lstrip("*").lower() for ext in _CODE_EXTENSIONS if ext.startswith("*.")
+) | {".iss", ".nsi", ".spec", ".lock", ".cfg", ".ini", ".txt"}
+
 _IGNORE_DIRS = {
     "venv", ".venv", "env", ".env", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "site-packages", ".eggs", "*.egg-info",
@@ -175,6 +184,9 @@ _IGNORE_DIRS = {
     "target", "bin", "obj", "release", "debug",
     ".git", ".svn", ".hg",
     ".idea", ".vscode", ".vs",
+    # Служебное состояние самого агента внутри проекта (usage-outbox, аудиты).
+    # Это не код пользователя: попав в граф, оно засоряет поиск и repo map.
+    ".zcode", ".ux-audit",
     "logs", "log", "tmp", "temp", ".cache", ".tmp",
     ".gradle", "vendor", "CMakeFiles", "coverage", ".coverage",
     "htmlcoverage", ".tox", "buck-out", ".angular",
@@ -532,6 +544,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     PRIMARY KEY (hash, model)
                 );
             """)
+            # Таблица regex-поиска создаётся здесь, вместе с остальной схемой,
+            # а не при первой сборке: граф открывают и читают напрямую другие
+            # процессы, и для уже существующих баз она иначе не появилась бы
+            # до ближайшего rebuild. Пустая таблица честнее отсутствующей —
+            # читатель получит «ничего не найдено», а не «FTS недоступен».
+            # Наполняет её build(); отсутствие FTS5 здесь не фатально.
+            self._ensure_text_table(con)
             fm_columns = {row[1] for row in con.execute("PRAGMA table_info(file_meta)").fetchall()}
             if "incoming_done" not in fm_columns:
                 # Legacy DBs: add the reverse-grep completion flag. Default 1
@@ -747,7 +766,47 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 logger.debug("dropping cross-file defines edge: %s -> %s (%s)", from_name, to_name, rel_path)
                 continue
             sanitized.append({"from": from_name, "relation": rel_type, "to": to_name})
-        return sanitized
+        return self._dedupe_relations(sanitized)
+
+    @staticmethod
+    def _dedupe_relations(relations: list[dict]) -> list[dict]:
+        """Collapse redundant edges between the same pair of nodes.
+
+        ``calls`` and ``uses`` between one pair describe the same link at
+        different precision, and the extractor happily emits both — which is
+        what puts duplicate edges into subgraphs and find_usages output. Keep
+        the stronger one. The template extractor does this inline because it
+        scans calls first; here the model returns relations in no particular
+        order, so the stronger edges have to be collected before filtering.
+        """
+        called = {(r["from"], r["to"]) for r in relations if r["relation"] == "calls"}
+        deduped: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for r in relations:
+            if r["relation"] == "uses" and (r["from"], r["to"]) in called:
+                continue
+            key = (r["from"], r["relation"], r["to"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+        return deduped
+
+    @staticmethod
+    def _looks_like_other_file(name: str) -> bool:
+        """Имя выглядит как путь к ДРУГОМУ файлу, а не как символ кода.
+
+        Признак — расширение из индексируемого набора у последнего сегмента
+        либо dotfile-имя (``.gitignore``). Символы вроде ``Api.get`` под это
+        не попадают: ``get`` не расширение файла.
+        """
+        leaf = name.rsplit("/", 1)[-1]
+        if leaf.startswith(".") and "." not in leaf[1:]:
+            return True  # .gitignore, .env, .dockerignore
+        if "." not in leaf:
+            return False
+        suffix = "." + leaf.rsplit(".", 1)[-1].lower()
+        return suffix in _FILE_ENTITY_SUFFIXES
 
     def _sanitize_extracted(
         self,
@@ -757,7 +816,23 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     ) -> dict:
         raw_entities = data.get("entities", []) if isinstance(data, dict) else []
         raw_relations = data.get("relations", []) if isinstance(data, dict) else []
-        entities = self._enrich_entity_locations(rel_path, [e for e in raw_entities if isinstance(e, dict)])
+        # Сущность-файл в батче допустима ровно одна — сам этот файл. Билдер
+        # регулярно приносит в write_batch(file=README.md) записи вида
+        # AGENTS.md / installer/setup.iss / .gitignore: он читал их рядом и
+        # приписал сюда же. Такие записи делают graph_file_structure смесью
+        # нескольких документов и порождают ложные usages, поэтому режем их
+        # на входе — симметрично тому, как _sanitize_relations режет
+        # cross-file defines.
+        kept_entities = []
+        for entity in raw_entities:
+            if not isinstance(entity, dict):
+                continue
+            name = str(entity.get("name", "")).strip().replace("\\", "/")
+            if name and name != rel_path and self._looks_like_other_file(name):
+                logger.debug("dropping foreign-file entity %s from batch of %s", name, rel_path)
+                continue
+            kept_entities.append(entity)
+        entities = self._enrich_entity_locations(rel_path, kept_entities)
         # Coerce the FILE's own entity away from "module" on non-code files:
         # build agents habitually label every file-entity "module", so .md
         # docs / stylesheets / templates / configs end up typed as code
@@ -1984,8 +2059,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 r_count = con.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
                 f_count = con.execute("SELECT COUNT(*) FROM file_meta").fetchone()[0]
 
-            if to_update or deleted_files:
+            changed = bool(to_update or deleted_files)
+            if changed:
                 self._rebuild_faiss()
+
+            # Индекс regex-поиска строится здесь, а не лениво внутри
+            # search_regex: граф читают и другие процессы напрямую из SQLite
+            # (десктопный воркер), и до ленивой инициализации они не доходят —
+            # для них таблицы chunks_fts просто не существовало.
+            self._ensure_text_index(force=changed)
 
             logger.info("Graph build done in %.2fs: %d indexed, %d entities",
                         time.time() - t0, len(to_update), e_count)
@@ -2253,15 +2335,30 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # shadow the actual `def` further down (line 121). So loop patterns in
         # the OUTER position: the weakest pattern (bare name) is only consulted
         # if no definition form exists.
-        patterns = [
-            f"def {entity_name}",
-            f"class {entity_name}",
-            f"function {entity_name}",
-            f"const {entity_name}",
-            f"let {entity_name}",
-            f"var {entity_name}",
-            entity_name,
-        ]
+        # Методы билдер называет квалифицированно — ``ProxyService.login`` —
+        # а в исходнике такой строки нет: объявление выглядит как ``login(``.
+        # Без запасного варианта по последнему сегменту весь класс методов
+        # оставался с line_start = NULL (и, как следствие, без сниппета,
+        # из которого считаются traits).
+        candidates = [entity_name]
+        leaf = entity_name.rsplit(".", 1)[-1]
+        if leaf and leaf != entity_name:
+            candidates.append(leaf)
+        patterns = []
+        for candidate in candidates:
+            patterns.extend([
+                f"def {candidate}",
+                f"class {candidate}",
+                f"function {candidate}",
+                f"const {candidate}",
+                f"let {candidate}",
+                f"var {candidate}",
+            ])
+        # Форма объявления метода в TS/Java/C#: имя сразу со скобкой, без
+        # ключевого слова. Проверяем ПОСЛЕ явных def/class/function, но
+        # ДО голого имени, иначе якорь уедет на импорт или комментарий.
+        patterns.extend(f"{candidate}(" for candidate in candidates[1:])
+        patterns.extend(candidates)
         match_index = None
         for pattern in patterns:
             for idx, line in enumerate(lines):

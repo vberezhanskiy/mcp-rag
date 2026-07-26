@@ -33,24 +33,56 @@ class GraphTextMixin:
 
     # ── FTS5 trigram regex search ───────────────────────────────────────────
 
-    def _ensure_text_index(self) -> int:
-        """Lazily build the FTS5 trigram chunk index for regex search.
+    def _ensure_text_table(self, con: sqlite3.Connection) -> bool:
+        """Create the FTS5 table when missing. ``False`` — FTS5 unavailable.
+
+        A build compiled without FTS5, or an SQLite older than the trigram
+        tokenizer (3.34), must degrade to "regex search is off" rather than
+        abort the whole rebuild.
+        """
+        try:
+            con.execute("SELECT 1 FROM chunks_fts LIMIT 1")
+            return True
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute(
+                "CREATE VIRTUAL TABLE chunks_fts USING fts5("
+                "content, file UNINDEXED, line_start UNINDEXED, "
+                "tokenize='trigram')"
+            )
+            return True
+        except sqlite3.OperationalError as e:
+            logger.warning(
+                "FTS5 trigram index unavailable, regex search disabled: %s", e
+            )
+            return False
+
+    def _ensure_text_index(self, force: bool = False) -> int:
+        """Build the FTS5 trigram chunk index for regex search.
 
         A chunk is a 100-line slice of a project file; trigram tokenizer
         makes any-substring MATCH sub-second on millions of lines.
-        Idempotent — re-runs are no-ops once the table has rows.
+
+        ``force=True`` rewrites the contents. Without it the index is built
+        once and then never refreshed — the early return on a non-empty table
+        kept serving chunks of files that had since changed.
         """
         with sqlite3.connect(self.db_path) as con:
-            try:
+            if not self._ensure_text_table(con):
+                return 0
+            if force:
+                # Plain DELETE, not the FTS5 'delete-all' command: the latter is
+                # rejected on a content-owning table like this one, and it fails
+                # by raising — leaving stale chunks in place while fresh ones
+                # pile up on top. DELETE also avoids the full-database rewrite
+                # that DROP + VACUUM would cost on every rebuild.
+                con.execute("DELETE FROM chunks_fts")
+            else:
                 count = con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
                 if count > 0:
                     return count
-            except sqlite3.OperationalError:
-                con.execute(
-                    "CREATE VIRTUAL TABLE chunks_fts USING fts5("
-                    "content, file UNINDEXED, line_start UNINDEXED, "
-                    "tokenize='trigram')"
-                )
+            con.commit()
 
         chunks: list[tuple[str, str, int]] = []
         chunk_lines = 100
