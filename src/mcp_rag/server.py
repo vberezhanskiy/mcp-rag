@@ -29,6 +29,7 @@ from .core.memory import MemorySystem
 from .core.metrics import default_metrics
 from .core.retriever import MultiLangCodeRetriever
 from .llm.extractor import LLMExtractor, NoOpExtractor, OpenAICompatExtractor
+from .paths import resolve_inside_project
 
 logger = logging.getLogger("mcp_rag")
 
@@ -1099,9 +1100,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return json.dumps(result, indent=2)
 
     if name == "graph_index_file":
-        path = Path(args["filepath"])
-        if not path.is_absolute():
-            path = services.config.project_root / path
+        path = resolve_inside_project(services.config.project_root, args["filepath"])
         if not path.exists():
             return f"File not found: {args['filepath']}"
         force_llm = bool(args.get("force_llm", False))
@@ -1111,9 +1110,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return f"Indexed {rel}: {len(entities)} entities{' (LLM)' if force_llm else ''}."
 
     if name == "graph_write_batch":
-        path = Path(args["filepath"])
-        if not path.is_absolute():
-            path = services.config.project_root / path
+        path = resolve_inside_project(services.config.project_root, args["filepath"])
         if not path.exists():
             return f"File not found: {args['filepath']}"
         result = g.write_batch(
@@ -1131,9 +1128,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         )
 
     if name == "graph_add_entity":
-        path = Path(args["filepath"])
-        if not path.is_absolute():
-            path = services.config.project_root / path
+        path = resolve_inside_project(services.config.project_root, args["filepath"])
         if not path.exists():
             return f"File not found: {args['filepath']}"
         result = g.add_entity(
@@ -1147,9 +1142,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return f"Added entity {result['name']} ({result['type']}) to {result['file']}."
 
     if name == "graph_add_relation":
-        path = Path(args["filepath"])
-        if not path.is_absolute():
-            path = services.config.project_root / path
+        path = resolve_inside_project(services.config.project_root, args["filepath"])
         if not path.exists():
             return f"File not found: {args['filepath']}"
         result = g.add_relation(
@@ -1172,9 +1165,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return json.dumps(g.get_schema(), indent=2)
 
     if name == "graph_invalidate":
-        path = Path(args["filepath"])
-        if not path.is_absolute():
-            path = services.config.project_root / path
+        path = resolve_inside_project(services.config.project_root, args["filepath"])
         result = g.mark_stale(filepath=path, cascade=bool(args.get("cascade", True)))
         marked = result.get("marked", [])
         if not marked:
@@ -1182,9 +1173,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         return f"Marked {len(marked)} file(s) stale:\n  " + "\n  ".join(marked)
 
     if name == "graph_affected_files":
-        path = Path(args["filepath"])
-        if not path.is_absolute():
-            path = services.config.project_root / path
+        path = resolve_inside_project(services.config.project_root, args["filepath"])
         result = g.affected_files(path)
         return json.dumps(result, indent=2)
 

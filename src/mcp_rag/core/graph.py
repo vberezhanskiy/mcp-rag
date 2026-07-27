@@ -29,6 +29,7 @@ from .embedder import encode_batch_size, encode_documents, encode_query
 from .graph_analysis import GraphAnalysisMixin
 from .graph_text import GraphTextMixin
 from ..llm.extractor import LLMExtractor, NoOpExtractor
+from ..paths import resolve_inside_project
 
 logger = logging.getLogger(__name__)
 
@@ -603,6 +604,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         suffixes = {ext.lstrip("*").lower() for ext in (_CODE_EXTENSIONS + self._extra_extensions)}
         fname = path.name.lower()
         return any(fname.endswith(suffix) for suffix in suffixes)
+
+    def _resolve_project_file(self, filepath: "Path | str") -> Path:
+        """Return a canonical path inside this graph's project root."""
+        return resolve_inside_project(self.project_root, filepath)
 
     def _should_ignore(self, path: Path) -> bool:
         if self._gitignore_parser is not None:
@@ -1232,6 +1237,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # through the LLM extractor even when not stale. Since the LLM is the
         # only source-code extractor now, this is mostly a "re-index even if
         # mtime matches" override.
+        filepath = self._resolve_project_file(filepath)
         if not self._is_indexable_file(filepath):
             logger.info("index_file: %s has a non-indexable extension, skipping", filepath.name)
             return
@@ -1274,6 +1280,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     async def reindex_file(
         self, filepath: Path, rebuild_faiss: bool = True, force_llm: bool = False
     ) -> None:
+        filepath = self._resolve_project_file(filepath)
         rel = filepath.relative_to(self.project_root).as_posix()
         self._delete_file_data(rel)
         await self.index_file(filepath, force_llm=force_llm)
@@ -1319,10 +1326,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             counts after sanitize. The number written may be less than
             the number passed in if entries failed validation.
         """
-        if isinstance(filepath, str):
-            filepath = Path(filepath)
-        if not filepath.is_absolute():
-            filepath = self.project_root / filepath
+        filepath = self._resolve_project_file(filepath)
         rel = filepath.relative_to(self.project_root).as_posix()
         if not self._is_indexable_file(filepath):
             # Also purge any rows a previous (pre-gate) build managed to
@@ -1578,10 +1582,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         per-call shape than ``write_batch`` (which requires the full
         entities + relations arrays upfront).
         """
-        if isinstance(filepath, str):
-            filepath = Path(filepath)
-        if not filepath.is_absolute():
-            filepath = self.project_root / filepath
+        filepath = self._resolve_project_file(filepath)
         rel = filepath.relative_to(self.project_root).as_posix()
         if not self._is_indexable_file(filepath):
             return {
@@ -1690,10 +1691,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         another file) or an entity defined inside any file (``"User"``
         to link to a class defined elsewhere). The lookup is name-based.
         """
-        if isinstance(filepath, str):
-            filepath = Path(filepath)
-        if not filepath.is_absolute():
-            filepath = self.project_root / filepath
+        filepath = self._resolve_project_file(filepath)
         rel = filepath.relative_to(self.project_root).as_posix()
         if not self._is_indexable_file(filepath):
             return {
@@ -1798,10 +1796,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         Returns: ``{"marked": [<rel>, ...]}`` — list of all files
             flagged (always includes the target itself).
         """
-        if isinstance(filepath, str):
-            filepath = Path(filepath)
-        if not filepath.is_absolute():
-            filepath = self.project_root / filepath
+        try:
+            filepath = self._resolve_project_file(filepath)
+        except ValueError:
+            return {"marked": [], "skipped": "outside_project_root"}
         try:
             rel = filepath.relative_to(self.project_root).as_posix()
         except ValueError:
@@ -1898,10 +1896,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             ``{"target": rel_path, "files": [<rel>, ...]}`` sorted.
             Result includes the target file itself.
         """
-        if isinstance(filepath, str):
-            filepath = Path(filepath)
-        if not filepath.is_absolute():
-            filepath = self.project_root / filepath
+        filepath = self._resolve_project_file(filepath)
         rel = filepath.relative_to(self.project_root).as_posix()
 
         with sqlite3.connect(self.db_path) as con:
@@ -2320,7 +2315,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 lines.append(f"      {snippet_line}")
         return lines
     def _find_entity_snippet(self, rel_path: str, entity_name: str) -> dict:
-        path = self.project_root / rel_path
+        try:
+            path = self._resolve_project_file(rel_path)
+        except ValueError:
+            return {}
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
