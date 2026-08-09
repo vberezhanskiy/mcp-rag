@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from mcp_rag.paths import resolve_inside_project
+from py_utils.paths import resolve_inside_project
 
 
 class ProjectPathTests(unittest.TestCase):

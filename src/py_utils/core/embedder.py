@@ -120,7 +120,7 @@ def get_embedder() -> SentenceTransformer:
     if _embedder is not None:
         return _embedder
 
-    cache_dir = _models_dir or (Path.home() / ".mcp-rag" / "models")
+    cache_dir = _models_dir or (Path.home() / ".py-utils" / "models")
     cache_dir.mkdir(parents=True, exist_ok=True)
     model_id = _embed_model_id()
     local_path = cache_dir / _model_dir_name(model_id)
@@ -209,7 +209,7 @@ def get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is not None:
         return _reranker
-    cache_dir = _models_dir or (Path.home() / ".mcp-rag" / "models")
+    cache_dir = _models_dir or (Path.home() / ".py-utils" / "models")
     cache_dir.mkdir(parents=True, exist_ok=True)
     model_id = _reranker_model_id()
     local_path = cache_dir / _model_dir_name(model_id)

@@ -1,6 +1,6 @@
 **English** · [Русский](README.ru.md)
 
-# mcp-rag
+# py-utils
 
 A self-hosted MCP server that turns any source tree into a **code knowledge graph** plus **hybrid semantic + lexical search** + an **interactive HTML visualization**. Designed for Claude Code, but speaks plain MCP so any MCP-aware client (Cursor, Continue, custom agents) can plug in.
 
@@ -17,7 +17,7 @@ Out of the box, Claude Code (and most coding agents) read files on demand via `R
 - **Code discovery** — "is there already a helper that does X?" — needs semantic matching, not name patterns.
 - **Multi-language projects** — Angular + NestJS + Python + FastAPI — each has its own conventions, but cross-cutting questions ("which frontend calls this endpoint?") need a unified index.
 
-mcp-rag pre-computes a **per-project graph** (tree-sitter for 10+ languages, regex fallback for the rest) and a **chunk index** (BM25 + dense embeddings via `bge-m3`, cross-encoder rerank). The result: an MCP tool surface where one call replaces 5–10 file reads.
+py-utils pre-computes a **per-project graph** (tree-sitter for 10+ languages, regex fallback for the rest) and a **chunk index** (BM25 + dense embeddings via `bge-m3`, cross-encoder rerank). The result: an MCP tool surface where one call replaces 5–10 file reads.
 
 ---
 
@@ -27,7 +27,7 @@ mcp-rag pre-computes a **per-project graph** (tree-sitter for 10+ languages, reg
 
 ```bash
 git clone <your-fork>
-cd mcp-rag
+cd py-utils
 python -m venv .venv
 .venv/Scripts/activate           # or `source .venv/bin/activate`
 pip install -e ".[llm,dev]"
@@ -36,7 +36,7 @@ pip install -e ".[llm,dev]"
 ### Plug into Claude Code
 
 ```bash
-claude mcp add rag --scope user -- /abs/path/to/.venv/bin/mcp-rag
+claude mcp add rag --scope user -- /abs/path/to/.venv/bin/py-utils
 ```
 
 Or edit `~/.claude.json` directly:
@@ -46,7 +46,7 @@ Or edit `~/.claude.json` directly:
   "mcpServers": {
     "rag": {
       "type": "stdio",
-      "command": "/abs/path/to/.venv/bin/mcp-rag"
+      "command": "/abs/path/to/.venv/bin/py-utils"
     }
   }
 }
@@ -73,7 +73,7 @@ graph_visualize           # writes HTML, open in browser
 For terminal exploration without a Claude Code session:
 
 ```
-mcp-rag --project /path/to/project repl
+py-utils --project /path/to/project repl
 rag> stats
 rag> search auth flow
 rag> usages LoginForm
@@ -87,9 +87,9 @@ rag> quit
 
 ---
 
-## Per-project config — `.mcp-rag.toml`
+## Per-project config — `.py-utils.toml`
 
-Drop a `.mcp-rag.toml` at the project root to extend defaults without env-var sprawl:
+Drop a `.py-utils.toml` at the project root to extend defaults without env-var sprawl:
 
 ```toml
 [ignore]
@@ -115,7 +115,7 @@ Everything is environment-driven. Set in your MCP config under `"env"` or in you
 | Variable | Default | What it does |
 |---|---|---|
 | `MCP_RAG_PROJECT` | cwd | Project root to index. Overridden by `--project` CLI arg. |
-| `MCP_RAG_STORAGE` | `~/.mcp-rag` | Where graph / faiss / cache / models live. |
+| `MCP_RAG_STORAGE` | `~/.py-utils` | Where graph / faiss / cache / models live. |
 
 ### Embedder
 
@@ -157,7 +157,7 @@ elsewhere if that bites.)
   "mcpServers": {
     "rag": {
       "type": "stdio",
-      "command": "D:\\Projects\\mcp-rag\\.venv\\Scripts\\mcp-rag.exe",
+      "command": "D:\\Projects\\py-utils\\.venv\\Scripts\\py-utils.exe",
       "args": [],
       "env": {
         "MCP_RAG_EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
@@ -166,7 +166,7 @@ elsewhere if that bites.)
       },
       "_available_env_options": {
         "MCP_RAG_PROJECT":        "Project root (default: cwd)",
-        "MCP_RAG_STORAGE":        "Storage root (default: ~/.mcp-rag)",
+        "MCP_RAG_STORAGE":        "Storage root (default: ~/.py-utils)",
         "MCP_RAG_EMBED_MODEL":    "Sentence-transformers id (default: BAAI/bge-m3). Lightweight: sentence-transformers/all-MiniLM-L6-v2",
         "MCP_RAG_RERANKER_MODEL": "Cross-encoder for rerank (default: BAAI/bge-reranker-base). Lightweight: cross-encoder/ms-marco-MiniLM-L-6-v2",
         "MCP_RAG_RERANK":         "0 to disable cross-encoder rerank (default: 1)",
@@ -195,7 +195,7 @@ or wrap the launcher in a shell script that loads from `.env`:
   "mcpServers": {
     "rag": {
       "type": "stdio",
-      "command": "/usr/local/bin/mcp-rag",
+      "command": "/usr/local/bin/py-utils",
       "env": {
         "MCP_RAG_LLM_BASE_URL": "https://api.deepseek.com/v1",
         "MCP_RAG_LLM_API_KEY": "sk-replace-with-your-key",
@@ -206,14 +206,14 @@ or wrap the launcher in a shell script that loads from `.env`:
 }
 ```
 
-Wrapper-script alternative on Windows (`start-mcp-rag.bat`):
+Wrapper-script alternative on Windows (`start-py-utils.bat`):
 
 ```bat
 @echo off
 set MCP_RAG_LLM_BASE_URL=https://api.deepseek.com/v1
 set MCP_RAG_LLM_API_KEY=sk-...
 set MCP_RAG_LLM_MODEL=deepseek-chat
-"D:\Projects\mcp-rag\.venv\Scripts\mcp-rag.exe" %*
+"D:\Projects\py-utils\.venv\Scripts\py-utils.exe" %*
 ```
 
 ```json
@@ -222,7 +222,7 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
     "rag": {
       "type": "stdio",
       "command": "cmd.exe",
-      "args": ["/c", "D:\\path\\start-mcp-rag.bat"]
+      "args": ["/c", "D:\\path\\start-py-utils.bat"]
     }
   }
 }
@@ -371,7 +371,7 @@ cross-encoder rerank lifts the top-K out of MiniLM's noisier output.
 ## Storage layout
 
 ```
-~/.mcp-rag/
+~/.py-utils/
 ├── models/
 │   └── BAAI_bge-m3/                           # downloaded once
 └── projects/
@@ -403,9 +403,9 @@ Anything else routes to the LLM fallback if configured, otherwise gets a file-le
 ## CLI
 
 ```
-mcp-rag --help
+py-utils --help
   --project PATH        project root (default: cwd)
-  --storage PATH        storage root (default: ~/.mcp-rag)
+  --storage PATH        storage root (default: ~/.py-utils)
   --log-level LEVEL     DEBUG | INFO | WARNING | ERROR
   --no-watch            disable filesystem watcher
 ```
@@ -425,7 +425,7 @@ pytest                                 # tests are still TBD; see TODO.md
 Smoke check the MCP handshake without going through Claude Code:
 
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1"}}}' | mcp-rag --project /path/to/repo
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1"}}}' | py-utils --project /path/to/repo
 ```
 
 ---

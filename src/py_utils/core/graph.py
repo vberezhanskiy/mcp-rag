@@ -486,7 +486,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # and trigger a rebuild before serving stale data.
         self._faiss_dirty = False
 
-        # Per-project overrides via .mcp-rag.toml (auto-loaded from the
+        # Per-project overrides via .py-utils.toml (auto-loaded from the
         # project root if not passed in).
         if project_config is None:
             from ..config import ProjectConfig as _PC
@@ -1141,7 +1141,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     def rebackfill_traits(self) -> int:
         """Recompute traits for every existing entity from scratch.
 
-        Useful after upgrading mcp-rag to pick up improved trait
+        Useful after upgrading py-utils to pick up improved trait
         detection without a full ``graph_clear + graph_build``. Returns
         the number of rows that ended up with a non-empty traits string.
         """

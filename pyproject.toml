@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-rag"
+name = "py-utils"
 version = "0.1.0"
 description = "MCP server exposing a code knowledge graph + hybrid RAG search for any project"
 readme = "README.md"
@@ -35,7 +35,7 @@ llm = ["httpx>=0.27"]
 dev = ["pytest>=8.0", "ruff>=0.4"]
 
 [project.scripts]
-mcp-rag = "mcp_rag.server:main"
+py-utils = "py_utils.server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mcp_rag"]
+packages = ["src/py_utils"]

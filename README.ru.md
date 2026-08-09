@@ -1,6 +1,6 @@
 [English](README.md) · **Русский**
 
-# mcp-rag
+# py-utils
 
 Self-hosted MCP-сервер, который превращает любое дерево исходников в **граф знаний по коду** + **гибридный семантический + лексический поиск** + **интерактивную HTML-визуализацию**. Заточен под Claude Code, но говорит на чистом MCP — подключится к любому MCP-клиенту (Cursor, Continue, кастомные агенты).
 
@@ -17,7 +17,7 @@ Self-hosted MCP-сервер, который превращает любое д�
 - **Code discovery** — «есть ли уже хелпер, который делает X?» — нужно семантическое сопоставление, не паттерны имён.
 - **Multi-language проектах** — Angular + NestJS + Python + FastAPI — у каждого свои конвенции, но кросс-вопросы («какой фронт зовёт этот endpoint?») требуют единого индекса.
 
-mcp-rag заранее считает **граф проекта** (tree-sitter для 10+ языков, regex-fallback для остального) и **chunk-индекс** (BM25 + плотные эмбеддинги через `bge-m3`, cross-encoder rerank). Результат: набор MCP-тулов, где один вызов заменяет 5–10 чтений файлов.
+py-utils заранее считает **граф проекта** (tree-sitter для 10+ языков, regex-fallback для остального) и **chunk-индекс** (BM25 + плотные эмбеддинги через `bge-m3`, cross-encoder rerank). Результат: набор MCP-тулов, где один вызов заменяет 5–10 чтений файлов.
 
 ---
 
@@ -27,7 +27,7 @@ mcp-rag заранее считает **граф проекта** (tree-sitter �
 
 ```bash
 git clone <your-fork>
-cd mcp-rag
+cd py-utils
 python -m venv .venv
 .venv/Scripts/activate           # или `source .venv/bin/activate`
 pip install -e ".[llm,dev]"
@@ -36,7 +36,7 @@ pip install -e ".[llm,dev]"
 ### Подключение к Claude Code
 
 ```bash
-claude mcp add rag --scope user -- /abs/path/to/.venv/bin/mcp-rag
+claude mcp add rag --scope user -- /abs/path/to/.venv/bin/py-utils
 ```
 
 Или правишь `~/.claude.json` напрямую:
@@ -46,7 +46,7 @@ claude mcp add rag --scope user -- /abs/path/to/.venv/bin/mcp-rag
   "mcpServers": {
     "rag": {
       "type": "stdio",
-      "command": "/abs/path/to/.venv/bin/mcp-rag"
+      "command": "/abs/path/to/.venv/bin/py-utils"
     }
   }
 }
@@ -75,7 +75,7 @@ graph_visualize           # генерит HTML, открывай в брауз�
 | Переменная | Default | Что делает |
 |---|---|---|
 | `MCP_RAG_PROJECT` | cwd | Корень проекта для индексации. Перебивается CLI-флагом `--project`. |
-| `MCP_RAG_STORAGE` | `~/.mcp-rag` | Где живут граф / faiss / cache / models. |
+| `MCP_RAG_STORAGE` | `~/.py-utils` | Где живут граф / faiss / cache / models. |
 
 ### Embedder
 
@@ -117,7 +117,7 @@ JSON не поддерживает комменты, но можно полож�
   "mcpServers": {
     "rag": {
       "type": "stdio",
-      "command": "D:\\Projects\\mcp-rag\\.venv\\Scripts\\mcp-rag.exe",
+      "command": "D:\\Projects\\py-utils\\.venv\\Scripts\\py-utils.exe",
       "args": [],
       "env": {
         "MCP_RAG_EMBED_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
@@ -126,7 +126,7 @@ JSON не поддерживает комменты, но можно полож�
       },
       "_available_env_options": {
         "MCP_RAG_PROJECT":        "Корень проекта (default: cwd)",
-        "MCP_RAG_STORAGE":        "Корень storage (default: ~/.mcp-rag)",
+        "MCP_RAG_STORAGE":        "Корень storage (default: ~/.py-utils)",
         "MCP_RAG_EMBED_MODEL":    "Sentence-transformers id (default: BAAI/bge-m3). Lightweight: sentence-transformers/all-MiniLM-L6-v2",
         "MCP_RAG_RERANKER_MODEL": "Cross-encoder для rerank (default: BAAI/bge-reranker-base). Lightweight: cross-encoder/ms-marco-MiniLM-L-6-v2",
         "MCP_RAG_RERANK":         "0 чтобы выключить cross-encoder rerank (default: 1)",
@@ -152,7 +152,7 @@ Claude Code передаёт значения `env` в subprocess **как ес�
   "mcpServers": {
     "rag": {
       "type": "stdio",
-      "command": "/usr/local/bin/mcp-rag",
+      "command": "/usr/local/bin/py-utils",
       "env": {
         "MCP_RAG_LLM_BASE_URL": "https://api.deepseek.com/v1",
         "MCP_RAG_LLM_API_KEY": "sk-replace-with-your-key",
@@ -163,14 +163,14 @@ Claude Code передаёт значения `env` в subprocess **как ес�
 }
 ```
 
-Альтернатива через wrapper-скрипт на Windows (`start-mcp-rag.bat`):
+Альтернатива через wrapper-скрипт на Windows (`start-py-utils.bat`):
 
 ```bat
 @echo off
 set MCP_RAG_LLM_BASE_URL=https://api.deepseek.com/v1
 set MCP_RAG_LLM_API_KEY=sk-...
 set MCP_RAG_LLM_MODEL=deepseek-chat
-"D:\Projects\mcp-rag\.venv\Scripts\mcp-rag.exe" %*
+"D:\Projects\py-utils\.venv\Scripts\py-utils.exe" %*
 ```
 
 ```json
@@ -179,7 +179,7 @@ set MCP_RAG_LLM_MODEL=deepseek-chat
     "rag": {
       "type": "stdio",
       "command": "cmd.exe",
-      "args": ["/c", "D:\\path\\start-mcp-rag.bat"]
+      "args": ["/c", "D:\\path\\start-py-utils.bat"]
     }
   }
 }
@@ -307,7 +307,7 @@ footprint. Multilingual теряется, но качество поиска п�
 ## Storage layout
 
 ```
-~/.mcp-rag/
+~/.py-utils/
 ├── models/
 │   └── BAAI_bge-m3/                           # скачивается один раз
 └── projects/
@@ -339,9 +339,9 @@ Regex-extractors: HTML, CSS/SCSS/LESS/Sass, JSON, YAML, TOML, Jinja-шаблон
 ## CLI
 
 ```
-mcp-rag --help
+py-utils --help
   --project PATH        корень проекта (default: cwd)
-  --storage PATH        корень storage (default: ~/.mcp-rag)
+  --storage PATH        корень storage (default: ~/.py-utils)
   --log-level LEVEL     DEBUG | INFO | WARNING | ERROR
   --no-watch            выключить filesystem watcher
 ```
@@ -361,7 +361,7 @@ pytest                                 # тесты пока в TODO; см. TODO
 Smoke-проверка MCP-handshake без Claude Code:
 
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1"}}}' | mcp-rag --project /path/to/repo
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1"}}}' | py-utils --project /path/to/repo
 ```
 
 ---

@@ -173,7 +173,7 @@ class OpenAICompatExtractor:
         try:
             import httpx
         except ImportError as e:
-            raise RuntimeError("httpx not installed — install with `pip install mcp-rag[llm]`") from e
+            raise RuntimeError("httpx not installed — install with `pip install py-utils[llm]`") from e
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:

@@ -1,4 +1,4 @@
-"""mcp-rag MCP server (stdio).
+"""py-utils MCP server (stdio).
 
 Exposes the code knowledge graph, hybrid code search, and project memory
 as MCP tools. Pin a project once via ``--project`` (or ``MCP_RAG_PROJECT``
@@ -31,7 +31,7 @@ from .core.retriever import MultiLangCodeRetriever
 from .llm.extractor import LLMExtractor, NoOpExtractor, OpenAICompatExtractor
 from .paths import resolve_inside_project
 
-logger = logging.getLogger("mcp_rag")
+logger = logging.getLogger("py_utils")
 
 
 class Services:
@@ -144,7 +144,7 @@ def _build_tools() -> list[Tool]:
                 "Direct entity/relation write — bypasses the LLM extractor. "
                 "Use this when YOU (the calling agent) have already extracted "
                 "reasoning over its content, and you want to persist the "
-                "result without re-running mcp-rag's own extraction.\n\n"
+                "result without re-running py-utils's own extraction.\n\n"
                 "Typical caller: a RAG-builder sub-agent that reads source "
                 "files with read_file/grep, decides on the entity list itself "
                 "with multi-file context, and submits each file's graph here.\n\n"
@@ -250,7 +250,7 @@ def _build_tools() -> list[Tool]:
                 "calls, imports, inherits, uses, instantiates). ``to`` can "
                 "be either an entity-name (resolves to definitions across "
                 "all files) or a project-relative file path (resolves to "
-                "the corresponding file-entity that mcp-rag auto-creates "
+                "the corresponding file-entity that py-utils auto-creates "
                 "for every indexed file).\n\n"
                 "Typical use: a RAG-builder sub-agent that has run "
                 "``graph_index_file`` on a file, then reads the source and "
@@ -302,7 +302,7 @@ def _build_tools() -> list[Tool]:
                 "silently dropped on write.\n\n"
                 "Call this ONCE at the start of a build session "
                 "instead of memorising lists from docstrings — the "
-                "schema lives in mcp-rag's code and is authoritative."
+                "schema lives in py-utils's code and is authoritative."
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
@@ -614,7 +614,7 @@ def _build_tools() -> list[Tool]:
                 "properties": {
                     "output_path": {
                         "type": "string",
-                        "description": "Where to write the HTML (default: ~/.mcp-rag/projects/<slug>/graph.html so the project working tree stays clean).",
+                        "description": "Where to write the HTML (default: ~/.py-utils/projects/<slug>/graph.html so the project working tree stays clean).",
                     },
                     "module_depth": {
                         "type": "integer",
@@ -693,7 +693,7 @@ def _build_tools() -> list[Tool]:
             description=(
                 "Recompute the `traits` column for every existing entity "
                 "using the current detection logic. Use after upgrading "
-                "mcp-rag to pick up improved heuristics without a full "
+                "py-utils to pick up improved heuristics without a full "
                 "graph_clear + graph_build cycle. Returns the number of "
                 "tagged rows."
             ),
@@ -1459,7 +1459,7 @@ async def _dispatch_inner(services: Services, name: str, args: dict) -> str:
         snap = default_metrics.snapshot()
         if bool(args.get("reset")):
             default_metrics.reset()
-        lines = ["# mcp-rag metrics"]
+        lines = ["# py-utils metrics"]
         if snap["counters"]:
             lines.append("\n## Counters")
             for k, v in sorted(snap["counters"].items()):
@@ -1872,7 +1872,7 @@ def _resource_kind_and_param(uri: AnyUrl) -> tuple[str, str]:
 
 
 def build_server(services: Services) -> Server:
-    server = Server("mcp-rag")
+    server = Server("py-utils")
     tools = _build_tools()
 
     @server.list_tools()
@@ -1957,7 +1957,7 @@ def _resolve_llm_extractor() -> LLMExtractor:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="mcp-rag", description="MCP server: code graph + RAG search")
+    parser = argparse.ArgumentParser(prog="py-utils", description="MCP server: code graph + RAG search")
     parser.add_argument(
         "--project",
         default=os.getenv("MCP_RAG_PROJECT") or os.getcwd(),
@@ -1966,7 +1966,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--storage",
         default=os.getenv("MCP_RAG_STORAGE"),
-        help="Storage root for SQLite/FAISS/cache (default ~/.mcp-rag)",
+        help="Storage root for SQLite/FAISS/cache (default ~/.py-utils)",
     )
     parser.add_argument(
         "--log-level",
@@ -2038,7 +2038,7 @@ _REPL_COMMANDS: dict[str, tuple[str, callable, str]] = {
 
 
 def _repl_help() -> str:
-    lines = ["mcp-rag REPL — commands:"]
+    lines = ["py-utils REPL — commands:"]
     for word in sorted(_REPL_COMMANDS):
         _, _, doc = _REPL_COMMANDS[word]
         lines.append("  " + doc)
@@ -2050,7 +2050,7 @@ def _repl_help() -> str:
 def _repl_run(services: Services) -> int:
     """Blocking interactive REPL — dispatches to the same async tools the MCP
     server exposes. Returns the process exit code (0 on clean exit)."""
-    print(f"mcp-rag REPL — project: {services.config.project_root}")
+    print(f"py-utils REPL — project: {services.config.project_root}")
     print("Type `help` for commands, `quit` to leave.\n")
     loop = asyncio.new_event_loop()
     try:
@@ -2091,7 +2091,7 @@ def main() -> None:
     storage = Path(args.storage) if args.storage else None
     config = Config(
         project_root=Path(args.project),
-        storage_root=storage or (Path.home() / ".mcp-rag"),
+        storage_root=storage or (Path.home() / ".py-utils"),
     )
     embedder.configure(config.models_dir)
 
@@ -2153,7 +2153,7 @@ def main() -> None:
             if services._build_task is not None and not services._build_task.done():
                 services._build_task.cancel()
 
-    logger.info("mcp-rag serving project=%s storage=%s watch=%s",
+    logger.info("py-utils serving project=%s storage=%s watch=%s",
                 config.project_root, config.storage_root, not args.no_watch)
     asyncio.run(_run())
 

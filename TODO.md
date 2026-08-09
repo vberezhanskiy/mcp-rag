@@ -1,4 +1,4 @@
-# mcp-rag — backlog
+# py-utils — backlog
 
 Ranked by value × effort. Pick from the top.
 
@@ -6,7 +6,7 @@ Ranked by value × effort. Pick from the top.
 - **Top-N files as concrete resources** — `resources/list` returns the 30 most "important" project files (top defined-entity count or top external-caller count) so they show up in Claude Code's `@`-picker without needing path autocomplete inside templates. Option B from the resources discussion.
 
 ## Config & DX
-- **`.mcp-rag.toml` in project root** — extra ignore dirs (`generated/`, `vendor/`), `max_file_size_mb`, optional LLM block. Auto-discovered from `cwd`. Currently only env vars (`MCP_RAG_DEVICE`, `MCP_RAG_LLM_*`).
+- **`.py-utils.toml` in project root** — extra ignore dirs (`generated/`, `vendor/`), `max_file_size_mb`, optional LLM block. Auto-discovered from `cwd`. Currently only env vars (`MCP_RAG_DEVICE`, `MCP_RAG_LLM_*`).
 - **Project context tool / resource** — `project_overview` already exists as a resource; promote/extend with detected stack (`package.json`, `pyproject.toml`, etc.) and a 1-paragraph human-readable summary so a single fetch primes a fresh session.
 
 ## Live mode

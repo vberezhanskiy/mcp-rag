@@ -1,10 +1,10 @@
-"""Runtime configuration for an mcp-rag instance.
+"""Runtime configuration for an py-utils instance.
 
 A single `Config` object pins the active project root and the storage
 directory; everything else (graph, retriever, memory) takes a `Config`
 or a `project_root` and derives its own paths from there.
 
-Optional per-project overrides live in ``<project_root>/.mcp-rag.toml``:
+Optional per-project overrides live in ``<project_root>/.py-utils.toml``:
 
     [ignore]
     dirs = ["my_generated_dir"]      # extra dirs to skip during graph_build
@@ -28,13 +28,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STORAGE = Path.home() / ".mcp-rag"
-PROJECT_CONFIG_FILENAME = ".mcp-rag.toml"
+DEFAULT_STORAGE = Path.home() / ".py-utils"
+PROJECT_CONFIG_FILENAME = ".py-utils.toml"
 
 
 @dataclass
 class ProjectConfig:
-    """Per-project overrides loaded from ``<project_root>/.mcp-rag.toml``.
+    """Per-project overrides loaded from ``<project_root>/.py-utils.toml``.
 
     Empty when the file is absent or unparseable — every subsystem falls
     back to its own defaults so the file is purely additive.
