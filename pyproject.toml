@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "py-utils"
 version = "0.1.0"
-description = "MCP server exposing a code knowledge graph + hybrid RAG search for any project"
+description = "Knowledge graph and hybrid RAG search for any project (used by the Digital Paragon RAG sidecar)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -17,7 +17,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "mcp>=1.0",
     "sentence-transformers>=2.7",
     "faiss-cpu>=1.8",
     "rank-bm25>=0.2.2",
@@ -26,16 +25,12 @@ dependencies = [
     "numpy>=1.26",
     "tqdm>=4.66",
     "json5>=0.9",
-    "watchdog>=3.0",
     "networkx>=3.0",
 ]
 
 [project.optional-dependencies]
 llm = ["httpx>=0.27"]
 dev = ["pytest>=8.0", "ruff>=0.4"]
-
-[project.scripts]
-py-utils = "py_utils.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/py_utils"]
