@@ -454,6 +454,28 @@ _TRAIT_PATTERNS_UNIVERSAL: list[tuple[str, re.Pattern]] = [
 ]
 
 
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
+def _connect(db_path) -> sqlite3.Connection:
+    """Соединение с графом.
+
+    WAL и busy_timeout не выставлялись нигде, поэтому действовал
+    rollback-journal и пятисекундное ожидание: полная пересборка делает VACUUM
+    под эксклюзивной блокировкой всей базы, и параллельные чтения падали с
+    «database is locked» — интерфейс получал голый 500, а записи билдера
+    возвращали модели ошибку, и файл молча оставался неиндексированным.
+    """
+    con = sqlite3.connect(db_path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
+    con.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.DatabaseError:
+        # Сетевые тома WAL не поддерживают — остаёмся на журнале по умолчанию.
+        pass
+    return con
+
+
 class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     """Knowledge Graph of a codebase, persisted in SQLite + FAISS.
 
@@ -478,8 +500,9 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         self.db_path = self.graph_dir / "graph.db"
         self.llm_extractor: LLMExtractor = llm_extractor or NoOpExtractor()
         self._init_db()
-        self.faiss_index = None
-        self.faiss_names: list[str] = []
+        # Индекс и имена — одно неделимое состояние: по отдельности они
+        # рассинхронизируются, и поиск начинает возвращать чужие сущности.
+        self._faiss: tuple[object | None, list[str]] = (None, [])
         self._is_building = False
         # Set when reindex_file runs without an immediate FAISS rebuild
         # (e.g. from the file-system watcher). Similarity tools check this
@@ -509,7 +532,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return self._is_building
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS entities (
                     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -662,21 +685,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return files
 
     def _get_files_indexed(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute("SELECT file FROM file_meta").fetchall()
         return [r[0] for r in rows]
 
     def _file_needs_update(self, filepath: Path) -> bool:
         rel = filepath.relative_to(self.project_root).as_posix()
         mtime = filepath.stat().st_mtime
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             row = con.execute(
                 "SELECT mtime FROM file_meta WHERE file = ?", (rel,)
             ).fetchone()
         return row is None or row[0] != mtime
 
     def _delete_file_data(self, rel_path: str) -> None:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             con.execute("DELETE FROM entities WHERE file = ?", (rel_path,))
             con.execute("DELETE FROM relations WHERE file = ?", (rel_path,))
             con.execute("DELETE FROM file_meta WHERE file = ?", (rel_path,))
@@ -1145,7 +1168,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         detection without a full ``graph_clear + graph_build``. Returns
         the number of rows that ended up with a non-empty traits string.
         """
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT rowid, file, name, type, COALESCE(snippet, '') FROM entities"
             ).fetchall()
@@ -1160,7 +1183,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return updated
 
     def _store_extracted(self, rel_path: str, mtime: float, data: dict, incoming_done: int = 1) -> None:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             for e in data.get("entities", []):
                 detected = self._detect_traits(
                     e.get("name", ""), e.get("snippet", ""), rel_path, e.get("type", ""),
@@ -1211,7 +1234,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
     def _mark_file_seen(self, rel: str, mtime: float) -> None:
         """Record file_meta without entities so the file isn't considered stale forever."""
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             con.execute(
                 "INSERT OR REPLACE INTO file_meta(file, mtime, indexed) VALUES(?,?,1)",
                 (rel, mtime),
@@ -1453,7 +1476,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             # Incoming edges point AT this file's previously-stored
             # definitions — sanitize must accept those names as valid
             # endpoints (the batch itself carries no entities).
-            with sqlite3.connect(self.db_path) as con:
+            with _connect(self.db_path) as con:
                 stored_names = {
                     row[0]
                     for row in con.execute(
@@ -1609,7 +1632,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not sanitized["entities"]:
             return {"file": rel, "added": 0, "skipped": "invalid_type_or_empty_name"}
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             # Self-heal: ensure the file-entity exists. ``add_entity`` may
             # be the first call for a file (no prior extraction pass), in
             # which case ``_make_file_entity`` never ran. Without this row,
@@ -1716,7 +1739,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 "allowed": sorted(_ALLOWED_RELATION_TYPES),
             }
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             cur = con.execute(
                 "INSERT OR IGNORE INTO relations(file, from_name, relation, to_name) VALUES(?,?,?,?)",
                 (rel, from_name, rel_type, to_name),
@@ -1817,7 +1840,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 logger.debug("mark_stale: cascade skipped for %s: %s", rel, e)
 
         marked: list[str] = []
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             for t in targets:
                 cur = con.execute(
                     "UPDATE file_meta SET mtime = 0 WHERE file = ?", (t,),
@@ -1899,7 +1922,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         filepath = self._resolve_project_file(filepath)
         rel = filepath.relative_to(self.project_root).as_posix()
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             # Entity names defined in the target file.
             target_names = {
                 row[0] for row in con.execute(
@@ -1986,7 +2009,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         existing = {p.relative_to(self.project_root).as_posix(): p for p in files}
 
         # Files indexed but still awaiting their incoming (reverse-grep) edges.
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             needs_incoming_set = {
                 r[0]
                 for r in con.execute(
@@ -2049,7 +2072,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
             await asyncio.gather(*[_index_with_sem(f) for f in to_update])
 
-            with sqlite3.connect(self.db_path) as con:
+            with _connect(self.db_path) as con:
                 e_count = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
                 r_count = con.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
                 f_count = con.execute("SELECT COUNT(*) FROM file_meta").fetchone()[0]
@@ -2143,7 +2166,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not self._faiss_dirty and self.faiss_index is not None:
             return
         try:
-            with sqlite3.connect(self.db_path) as con:
+            with _connect(self.db_path) as con:
                 n = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
         except Exception:
             return
@@ -2152,11 +2175,27 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         else:
             self._faiss_dirty = False
 
+    @property
+    def faiss_index(self):
+        """Текущий индекс. Читателю, которому нужны и имена, — ``faiss_pair``."""
+        return self._faiss[0]
+
+    @property
+    def faiss_names(self) -> list[str]:
+        return self._faiss[1]
+
+    @property
+    def faiss_pair(self) -> tuple[object | None, list[str]]:
+        """Согласованная пара: снимается одной операцией, поэтому пересборка
+        индекса в другом потоке не может подсунуть новые имена к старому
+        индексу."""
+        return self._faiss
+
     def _rebuild_faiss(self) -> None:
         self._faiss_dirty = False
         try:
             import faiss
-            with sqlite3.connect(self.db_path) as con:
+            with _connect(self.db_path) as con:
                 rows = con.execute(
                     "SELECT file, name, description, snippet FROM entities ORDER BY id"
                 ).fetchall()
@@ -2166,8 +2205,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     "SELECT file, from_name, relation, to_name FROM relations"
                 ).fetchall()
             if not rows:
-                self.faiss_index = None
-                self.faiss_names = []
+                self._faiss = (None, [])
                 return
             from collections import defaultdict
             rels_map: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
@@ -2180,7 +2218,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 )
                 for r in rows
             ]
-            self.faiss_names = [r[1] for r in rows]
+            # Имена НЕ публикуем сразу: между этой строкой и заменой самого
+            # индекса лежит обращение к энкодеру, а это секунды или минуты на
+            # CPU. Всё это время объект оставался в состоянии «имена новые,
+            # индекс старый», и параллельный /search_code искал по старому
+            # индексу, а результат брал из нового списка имён — то есть молча
+            # возвращал модели чужие сущности. Собираем в локальной переменной
+            # и публикуем пару одним присваиванием в конце.
+            names = [r[1] for r in rows]
 
             # Content-addressable cache (Cursor-style Merkle reuse): each
             # entity's embedding is keyed by sha256(text + model_id). On
@@ -2191,7 +2236,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             model_id = _embed_model_id()
             hashes = [hashlib.sha256(f"{model_id}\n{t}".encode("utf-8")).hexdigest()[:32] for t in texts]
             cached_vecs: dict[str, "np.ndarray"] = {}
-            with sqlite3.connect(self.db_path) as con:
+            with _connect(self.db_path) as con:
                 # Look up in batches — SQLite caps `IN (?,?,...)` at ~999 params.
                 unique_hashes = list({h for h in hashes})
                 for i in range(0, len(unique_hashes), 800):
@@ -2220,7 +2265,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 for pos, src_idx in enumerate(missing_idxs):
                     cached_vecs[hashes[src_idx]] = new_vecs[pos]
                 # Persist new entries.
-                with sqlite3.connect(self.db_path) as con:
+                with _connect(self.db_path) as con:
                     con.executemany(
                         "INSERT OR REPLACE INTO embedding_cache(hash, model, dim, vec) VALUES (?, ?, ?, ?)",
                         [
@@ -2233,16 +2278,18 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             import numpy as np
             embeddings = np.stack([cached_vecs[h] for h in hashes]).astype("float32")
             dim = embeddings.shape[1]
-            self.faiss_index = faiss.IndexFlatIP(dim)
-            self.faiss_index.add(embeddings)
+            index = faiss.IndexFlatIP(dim)
+            index.add(embeddings)
+            # Пара публикуется атомарно для читателя: он снимает её одной
+            # строкой, поэтому несогласованное состояние ему не видно.
+            self._faiss = (index, names)
             logger.info(
                 "FAISS index built: %d entities  (cache hits %d/%d = %.1f%%)",
-                len(self.faiss_names), cache_hits, len(hashes),
+                len(names), cache_hits, len(hashes),
                 (cache_hits / max(len(hashes), 1)) * 100,
             )
         except Exception as e:
-            self.faiss_index = None
-            self.faiss_names = []
+            self._faiss = (None, [])
             logger.warning("FAISS rebuild failed: %s", e)
 
     @staticmethod
@@ -2258,7 +2305,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # Match both the bare ``to_name`` and dotted import targets whose leaf
         # segment equals ``name`` — many builders record cross-file references
         # as ``imports pkg.mod.Name`` rather than ``calls Name``.
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT file, from_name, relation, to_name FROM relations "
                 "WHERE to_name = ? OR to_name LIKE ? ESCAPE '\\' "
@@ -2268,7 +2315,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return [{"file": r[0], "from": r[1], "relation": r[2], "to": r[3]} for r in rows]
 
     def get_file_deps(self, rel_path: str) -> list[dict]:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT from_name, relation, to_name FROM relations WHERE file = ? AND relation IN ('imports','inherits','uses') ORDER BY relation, from_name, to_name",
                 (rel_path,),
@@ -2276,7 +2323,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return [{"from": r[0], "relation": r[1], "to": r[2]} for r in rows]
 
     def get_callers(self, function_name: str) -> list[dict]:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT file, from_name FROM relations "
                 "WHERE (to_name = ? OR to_name LIKE ? ESCAPE '\\') AND relation = 'calls' "
@@ -2286,7 +2333,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return [{"file": r[0], "caller": r[1]} for r in rows]
 
     def get_file_entities(self, rel_path: str) -> list[dict]:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT name, type, description, line_start, line_end, snippet FROM entities "
                 "WHERE file = ? "
@@ -2433,7 +2480,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not tokens:
             tokens = [query.strip()] if query.strip() else []
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             if not tokens:
                 # Empty query — list-all mode. Useful when the caller only
                 # wants a type filter ("show every class", browse-by-type
@@ -2508,13 +2555,17 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 "line_end": line_end,
                 "snippet": snippet,
             })
-        if self.faiss_index is not None and self.faiss_names:
+        # Пара снимается одной операцией: пересборка индекса в другом потоке
+        # иначе подставляла новые имена к старому индексу, и поиск молча
+        # возвращал чужие сущности.
+        faiss_index, faiss_index_names = self.faiss_pair
+        if faiss_index is not None and faiss_index_names:
             try:
                 q_vec = encode_query([query], normalize_embeddings=True,
                                      show_progress_bar=False).astype("float32")
-                k = min(limit, self.faiss_index.ntotal)
-                scores, indices = self.faiss_index.search(q_vec, k)
-                faiss_top = {self.faiss_names[i] for s, i in zip(scores[0], indices[0])
+                k = min(limit, faiss_index.ntotal)
+                scores, indices = faiss_index.search(q_vec, k)
+                faiss_top = {faiss_index_names[i] for s, i in zip(scores[0], indices[0])
                              if i >= 0 and s > 0.3}
                 results.sort(key=lambda r: (0 if r["name"] in faiss_top else 1, r["name"]))
             except Exception as e:
@@ -2524,13 +2575,14 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             return results
         # LIKE found nothing — try FAISS-only as a fallback for natural-language
         # queries that don't match any entity name (e.g. Russian questions).
-        if self.faiss_index is not None and self.faiss_names:
+        faiss_index, faiss_index_names = self.faiss_pair
+        if faiss_index is not None and faiss_index_names:
             try:
                 q_vec = encode_query([query], normalize_embeddings=True,
                                      show_progress_bar=False).astype("float32")
-                k = min(limit, self.faiss_index.ntotal)
-                scores, indices = self.faiss_index.search(q_vec, k)
-                faiss_names = [self.faiss_names[i] for s, i in zip(scores[0], indices[0])
+                k = min(limit, faiss_index.ntotal)
+                scores, indices = faiss_index.search(q_vec, k)
+                faiss_names = [faiss_index_names[i] for s, i in zip(scores[0], indices[0])
                                if i >= 0 and s > 0.1][:limit]
                 if faiss_names:
                     results = self.search_entity(" ".join(faiss_names), entity_type=entity_type, limit=limit)
@@ -2567,7 +2619,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         truncated_nodes: list[str] = []
         skipped_hubs: list[str] = []
         queue: list[tuple[str, int]] = [(entity_name, 0)]
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             # Pre-compute file-fanout per name so we can recognize hubs in O(1)
             # during BFS instead of running a count query per neighbor.
             name_fanout = dict(con.execute(
@@ -2631,7 +2683,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         }
 
     def get_stats(self) -> dict:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             e = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
             r = con.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
             f = con.execute("SELECT COUNT(*) FROM file_meta").fetchone()[0]
@@ -2692,7 +2744,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         }
 
     def clear(self) -> None:
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             con.executescript("DELETE FROM entities; DELETE FROM relations; DELETE FROM file_meta;")
         # SQLite keeps freed pages for reuse — DELETE alone won't shrink
         # the .db file. VACUUM rewrites the database to compact form, but
@@ -2706,7 +2758,6 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 con.close()
         except Exception as e:
             logger.warning("VACUUM after clear failed: %s", e)
-        self.faiss_index = None
-        self.faiss_names = []
+        self._faiss = (None, [])
         self._faiss_dirty = False
         logger.info("Code graph cleared")

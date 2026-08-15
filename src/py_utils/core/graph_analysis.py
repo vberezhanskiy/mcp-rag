@@ -80,7 +80,11 @@ class GraphAnalysisMixin:
 
         if self.faiss_index is None or not self.faiss_names or self._faiss_dirty:
             self._rebuild_faiss()
-        if self.faiss_index is None or not self.faiss_names:
+        # Пару снимаем одной операцией: пересборка индекса в другом потоке
+        # иначе подставляла новые имена к старому индексу, и поиск возвращал
+        # чужие сущности.
+        faiss_index, faiss_names = self.faiss_pair
+        if faiss_index is None or not faiss_names:
             return {
                 "anchor": entity_name,
                 "results": [],
@@ -121,8 +125,8 @@ class GraphAnalysisMixin:
         try:
             q_vec = encode_query([anchor_text], normalize_embeddings=True,
                                  show_progress_bar=False).astype("float32")
-            k = min(self.faiss_index.ntotal, max(limit * 8, 80))
-            scores, indices = self.faiss_index.search(q_vec, k)
+            k = min(faiss_index.ntotal, max(limit * 8, 80))
+            scores, indices = faiss_index.search(q_vec, k)
         except Exception as e:
             logger.warning("find_similar_entities: FAISS query failed: %s", e)
             return {"anchor": entity_name, "results": [], "warning": str(e)}
@@ -133,9 +137,9 @@ class GraphAnalysisMixin:
             for score, idx in zip(scores[0], indices[0]):
                 if idx < 0 or score < min_score:
                     continue
-                if idx >= len(self.faiss_names):
+                if idx >= len(faiss_names):
                     continue
-                cand_name = self.faiss_names[idx]
+                cand_name = faiss_names[idx]
                 if cand_name == entity_name:
                     continue
                 row = con.execute(
@@ -394,7 +398,8 @@ class GraphAnalysisMixin:
         """
         if self.faiss_index is None or not self.faiss_names or self._faiss_dirty:
             self._rebuild_faiss()
-        if self.faiss_index is None or self.faiss_index.ntotal == 0:
+        faiss_index, faiss_names = self.faiss_pair
+        if faiss_index is None or faiss_index.ntotal == 0:
             return {"clusters": [], "warning": "Graph FAISS index is empty — run rag_rebuild first."}
 
         types = set(entity_types) if entity_types else set(self._PRIMARY_DEF_TYPES)
@@ -407,7 +412,7 @@ class GraphAnalysisMixin:
                 "SELECT file, from_name, relation, to_name FROM relations"
             ).fetchall()
 
-        if len(all_entities) != len(self.faiss_names):
+        if len(all_entities) != len(faiss_names):
             return {"clusters": [], "warning": "FAISS index out of sync; run rag_rebuild."}
 
         shape_map: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
@@ -423,9 +428,9 @@ class GraphAnalysisMixin:
 
         try:
             import numpy as np
-            vecs = np.stack([self.faiss_index.reconstruct(int(i)) for i in candidate_idxs])
-            k = min(self.faiss_index.ntotal, max(top_k_per_entity * 4, top_k_per_entity + 2))
-            scores, neighbors = self.faiss_index.search(vecs, k)
+            vecs = np.stack([faiss_index.reconstruct(int(i)) for i in candidate_idxs])
+            k = min(faiss_index.ntotal, max(top_k_per_entity * 4, top_k_per_entity + 2))
+            scores, neighbors = faiss_index.search(vecs, k)
         except Exception as e:
             return {"clusters": [], "warning": f"FAISS query failed: {e}"}
 
