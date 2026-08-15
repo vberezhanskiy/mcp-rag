@@ -476,6 +476,31 @@ def _connect(db_path) -> sqlite3.Connection:
     return con
 
 
+# Файлы, содержимое которых не должно попадать в граф.
+#
+# Промпт билдера прямо велит расписывать .env по переменным, а обогащение
+# сущности сохраняет окно строк вокруг совпадения — то есть `KEY=<значение>`
+# ложилось в graph.db открытым текстом, участвовало в тексте для FAISS и
+# возвращалось любым /search_code, попавшим в эту сущность. Имена переменных
+# для навигации полезны, значения — нет.
+_SECRET_FILE_PATTERNS = (
+    ".env",
+    ".pem",
+    ".key",
+    ".pfx",
+    ".p12",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "secrets",
+)
+
+
+def _is_secret_file(rel_path: str) -> bool:
+    name = str(rel_path).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return any(marker in name for marker in _SECRET_FILE_PATTERNS)
+
+
 class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
     """Knowledge Graph of a codebase, persisted in SQLite + FAISS.
 
@@ -757,13 +782,16 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 entity_type = "symbol"
             description = self._normalize_whitespace(str(entity.get("description", "")), limit=300)
             snippet_info = self._find_entity_snippet(rel_path, name)
+            secret_file = _is_secret_file(rel_path)
             enriched.append({
                 "name": name,
                 "type": entity_type,
-                "description": description,
+                # Из файла с секретами берём только имя и координаты: значение
+                # переменной не нужно ни поиску, ни навигации, а утечь может.
+                "description": "" if secret_file else description,
                 "line_start": snippet_info["line_start"],
                 "line_end": snippet_info["line_end"],
-                "snippet": snippet_info["snippet"],
+                "snippet": "" if secret_file else snippet_info["snippet"],
                 "tags": tags,
             })
         return enriched
