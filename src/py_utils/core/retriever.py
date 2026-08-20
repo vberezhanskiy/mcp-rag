@@ -18,6 +18,8 @@ import numpy as np
 from diskcache import Cache
 from rank_bm25 import BM25Okapi
 from tqdm import tqdm
+
+from ..paths import is_inside_project, is_secret_file
 import gitignore_parser
 
 from .embedder import (
@@ -128,6 +130,19 @@ class MultiLangCodeRetriever:
                 path = Path(fpath)
                 if not path.is_file() or self._should_ignore(path):
                     continue
+                # is_file() идёт ПО симлинку и отвечает про цель, а разрешённый
+                # путь никто не сверял: симлинк credentials.json →
+                # ~/.aws/credentials внутри репозитория выглядел обычным файлом
+                # проекта, читался и попадал в индекс, откуда его возвращает
+                # search_code. os.walk бережёт только каталоги, файлы — нет.
+                if not is_inside_project(self.root_dir, path):
+                    logger.warning("Skipped %s: resolves outside the project root", fpath)
+                    continue
+                # Секретные файлы не индексируем вовсе: список расширений выше
+                # включает .json/.yaml/.toml, то есть credentials.json и
+                # secrets.yaml ложились в чанки целиком и возвращались модели.
+                if is_secret_file(path.name):
+                    continue
                 files.append(path)
         return sorted(files)
 
@@ -178,7 +193,19 @@ class MultiLangCodeRetriever:
                 logger.warning("Skipped %s: %s", path, e)
 
         if not documents:
-            logger.warning("No indexable code chunks found")
+            # Пустая пересборка ОБНУЛЯЕТ индекс, а не сохраняет прошлый.
+            #
+            # Ранний return оставлял в памяти bm25, faiss_index и chunks от
+            # предыдущей сборки: после удаления файлов (или переключения на
+            # пустой проект) rebuild() отрабатывал «успешно», а поиск
+            # продолжал уверенно возвращать куски исходников, которых уже нет.
+            # Пустой ответ честнее чужого.
+            logger.warning("No indexable code chunks found — dropping the previous index")
+            self.bm25 = None
+            self.faiss_index = None
+            self.chunks = []
+            self.file_paths = []
+            self.line_numbers = []
             return
 
         self.bm25 = BM25Okapi(tokenized_corpus)

@@ -29,7 +29,12 @@ from .embedder import encode_batch_size, encode_documents, encode_query
 from .graph_analysis import GraphAnalysisMixin
 from .graph_text import GraphTextMixin
 from ..llm.extractor import LLMExtractor, NoOpExtractor
-from ..paths import resolve_inside_project
+from ..paths import (
+    SECRET_FILE_PATTERNS,
+    is_inside_project,
+    is_secret_file,
+    resolve_inside_project,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -476,29 +481,20 @@ def _connect(db_path) -> sqlite3.Connection:
     return con
 
 
-# Файлы, содержимое которых не должно попадать в граф.
+# Файлы, содержимое которых не покидает машину.
 #
 # Промпт билдера прямо велит расписывать .env по переменным, а обогащение
 # сущности сохраняет окно строк вокруг совпадения — то есть `KEY=<значение>`
 # ложилось в graph.db открытым текстом, участвовало в тексте для FAISS и
 # возвращалось любым /search_code, попавшим в эту сущность. Имена переменных
 # для навигации полезны, значения — нет.
-_SECRET_FILE_PATTERNS = (
-    ".env",
-    ".pem",
-    ".key",
-    ".pfx",
-    ".p12",
-    "id_rsa",
-    "id_ed25519",
-    "credentials",
-    "secrets",
-)
-
-
-def _is_secret_file(rel_path: str) -> bool:
-    name = str(rel_path).replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return any(marker in name for marker in _SECRET_FILE_PATTERNS)
+#
+# Само определение живёт в py_utils.paths: тот же список нужен FTS-индексу
+# (graph_text) и ретриверу, а три копии одного перечня — верный способ однажды
+# закрыть файл в одном месте и оставить открытым в двух других. Псевдонимы
+# оставлены, чтобы не трогать обращения по всему модулю.
+_SECRET_FILE_PATTERNS = SECRET_FILE_PATTERNS
+_is_secret_file = is_secret_file
 
 
 class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
@@ -702,6 +698,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
                 path = Path(fpath)
                 if not path.is_file() or self._should_ignore(path):
+                    continue
+                # is_file() отвечает про ЦЕЛЬ симлинка, а разрешённый путь тут
+                # никто не сверял: ссылка изнутри репозитория на файл снаружи
+                # выглядела обычным файлом проекта и уходила в индексацию.
+                # os.walk бережёт только каталоги (followlinks=False).
+                if not is_inside_project(self.project_root, path):
+                    logger.warning("Skipped %s: resolves outside the project root", fpath)
                     continue
 
                 seen.add(fpath)
@@ -1295,6 +1298,21 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         if not force_llm and not self._file_needs_update(filepath):
             return
         rel = filepath.relative_to(self.project_root).as_posix()
+        # Секретный файл не читаем вовсе.
+        #
+        # _is_secret_file применялся и раньше — но в _sanitize_entities, то
+        # есть ПОСЛЕ того, как полный текст ушёл в llm_extractor. Чистка
+        # результата бережёт graph.db и ничего не меняет в самом запросе:
+        # ключи, пароль базы и подписи к этому моменту уже у стороннего
+        # провайдера. Отметка в file_meta нужна, чтобы файл не считался
+        # устаревшим вечно и обход сходился.
+        if _is_secret_file(rel):
+            try:
+                self._mark_file_seen(rel, filepath.stat().st_mtime)
+            except OSError:
+                pass
+            logger.info("Skipped %s: secret file, contents never leave the machine", rel)
+            return
         try:
             stat = filepath.stat()
             mtime = stat.st_mtime

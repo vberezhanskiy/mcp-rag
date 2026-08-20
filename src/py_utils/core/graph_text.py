@@ -14,6 +14,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from ..paths import is_secret_file as _is_secret_file
+
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,13 @@ class GraphTextMixin:
         chunks: list[tuple[str, str, int]] = []
         chunk_lines = 100
         for path in self._get_files():
+            rel = path.relative_to(self.project_root).as_posix()
+            # FTS хранит куски ИСХОДНОГО текста и отдаёт их назад целиком
+            # (search_regex, проверка живости кода в Node-воркере). Для .env
+            # это буквально «KEY=значение» в общей базе графа — то самое, от
+            # чего сущности уже чистятся при записи.
+            if _is_secret_file(rel):
+                continue
             try:
                 stat = path.stat()
                 if stat.st_size > self._max_file_bytes:
@@ -94,7 +103,6 @@ class GraphTextMixin:
                 text = path.read_text(encoding="utf-8", errors="ignore")
             except Exception:
                 continue
-            rel = path.relative_to(self.project_root).as_posix()
             lines = text.splitlines()
             for i in range(0, len(lines), chunk_lines):
                 chunk = "\n".join(lines[i:i + chunk_lines])
